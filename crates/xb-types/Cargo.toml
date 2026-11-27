@@ -1,0 +1,15 @@
+[package]
+name = "xb-types"
+description = "Shared vocabulary of the xbemu core: addresses, pad state, settings, interrupt lines, memory traits."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
