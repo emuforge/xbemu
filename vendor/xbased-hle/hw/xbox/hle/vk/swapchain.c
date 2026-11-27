@@ -1,0 +1,2902 @@
+/*
+ * xbased HLE GPU — the window's presenter (swapchain.h): the front frame
+ * (display.h) drawn into the app's window through a Vulkan swapchain, once
+ * per display refresh, on the window's thread (native/app/present.c).
+ *
+ * Each refresh: a swapchain image (waiting for one paces the thread to the
+ * panel: FIFO), the front frame, and one pass that letterboxes the frame
+ * into the image, the rest black, through the display's gamma ramp. The
+ * anti-aliasing on the way:
+ *  - FXAA over each new frame at its own size, into an image of ours, once a
+ *    frame however many refreshes show it;
+ *  - a frame larger than its place in the window (a render scale above the
+ *    screen's) is averaged down, each window pixel the mean of the frame
+ *    pixels it covers, where a bilinear sample would skip most of them and
+ *    keep the edges' stairs;
+ *  - a smaller one is scaled up bilinearly, or by AMD FidelityFX Super
+ *    Resolution 1: EASU rebuilds its edges into an image of ours at the
+ *    size it takes in the window, once a frame, and RCAS sharpens that on
+ *    its way into the window.
+ * FXAA is FXAA 3.11 Quality (Timothy Lottes) as PCSX2's fxaa.fx tunes it
+ * (GPL-3.0-or-later); FSR 1 is AMD's ffx_fsr1.h (MIT,
+ * licenses/amd-fsr1.license.txt).
+ *
+ * The queue is the render thread's too (hle_vk_queue_lock): queue order
+ * puts our reads of a frame after its writes, and the render thread's next
+ * write of the slot after our reads (its barriers). The device table is the
+ * presenter's own: the render thread's wraps its commands for
+ * strip batching (batch.c). The surface follows the window: a new
+ * ANativeWindow (the activity's surface made again) gets a new surface and
+ * swapchain, none drops them.
+ */
+#include "hw/xbox/hle/base.h"
+#include "hw/xbox/hle/hle.h"
+#include "hw/xbox/hle/shader/glsl_compile.h"
+#include "hw/xbox/hle/vk/back_int.h"
+#include "hw/xbox/hle/vk/compat.h"
+#include "hw/xbox/hle/vk/display.h"
+#include "hw/xbox/hle/vk/quirks.h"
+#include "hw/xbox/hle/vk/swapchain.h"
+
+/* the pictures a player keeps (screenshots, savestates' thumbnails) as JPEG:
+ * a 32-bit BMP of a scaled frame is 14 MB */
+#define STB_IMAGE_WRITE_STATIC
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "native/third_party/stb/stb_image_write.h"
+
+#include "hw/xbox/hle/vk/native_window.h"
+#include <errno.h>
+#include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#include "hw/xbox/hle/vk/share.h"
+#include <psapi.h>
+#endif
+#if defined(NC_DESKTOP) && !defined(_WIN32) && !defined(XBEMU_HOST)
+#include <SDL3/SDL_vulkan.h>
+#endif
+
+#define T (g_ps.t)
+#define PS_FRAMES 3             /* the presenter's submits in flight */
+enum { SET_WINDOW, SET_FXAA, SET_EASU, SET_OSD, PS_SETS };  /* a frame's descriptor sets */
+#define PS_RAMP 1024            /* a frame's share of the ramp buffer (768 used) */
+
+/* the window's pipelines, then those into images of ours (R8G8B8A8) */
+enum { P_BILINEAR, P_AREA, P_RCAS, P_CRT, P_OSD, P_KDOWN, P_KUP, P_FXAA, P_EASU, P_COUNT };
+
+/* An image of ours a pass draws into and the window's pass samples. */
+typedef struct PsImg {
+    VkImage img;
+    VkDeviceMemory mem;
+    VkImageView view;
+    uint32_t w, h;
+    VkFormat fmt;
+    uint64_t serial;            /* the frame it holds (0: none) */
+    bool fxaa;                  /* FSR's: made from FXAA's */
+} PsImg;
+
+typedef struct PsFrame {
+    VkCommandPool pool;
+    VkCommandBuffer cb;
+    VkSemaphore acquired;       /* its swapchain image is ready */
+    /* the window pass's, FXAA's, EASU's, the frame counter's: one a pass of a
+     * frame, as a set written again after a draw used it changes that draw
+     * too where the driver reads sets as the GPU runs (AMD's: FXAA's pass,
+     * sharing EASU's, sampled the image it drew into, noise and a seam
+     * across the picture with FSR at 1x and 2x) */
+    VkDescriptorSet set[PS_SETS];
+    uint64_t value;             /* its last submit's on the timeline */
+    bool ramp_stale;            /* its share of the ramp buffer is behind */
+    /* the overlay's: the scene's and its blur's sets, the blur passes',
+     * its vertices and the uploads' staging (host-visible, grown) */
+    VkDescriptorSet ovs[2], bset[10];
+    VkBuffer vbuf, stage;
+    VkDeviceMemory vmem, stage_mem;
+    uint8_t *vmap, *stage_map;
+    VkDeviceSize vsize, stage_size;
+} PsFrame;
+
+static struct {
+    struct VolkDeviceTable t;
+    bool inited, failed;
+    VkSemaphore tl;             /* timeline: each submit's value */
+    uint64_t submitted;
+    VkSampler smp;
+    VkSampler smp_near;         /* the picture's, upscaled as nearest neighbour (HLE_UPSCALE_NEAREST) */
+    VkDescriptorSetLayout dsl;
+    VkPipelineLayout pl;
+    VkDescriptorPool dp;
+    VkBuffer ubo;
+    VkDeviceMemory ubo_mem;
+    uint8_t *ubo_map;
+    VkShaderModule vs, fs[P_COUNT];
+    VkPipeline pipe[P_COUNT];
+    VkFormat pipe_fmt;          /* the window pipelines' */
+    PsFrame fr[PS_FRAMES];
+    unsigned cur;
+    /* the window */
+    struct ANativeWindow *win;
+    int64_t lost_ns;            /* its surface was lost then: tried again a while after */
+    VkSurfaceKHR surf;
+    VkSwapchainKHR sc;
+    VkFormat fmt;
+    VkExtent2D ext, wsize;      /* the images' (the panel's orientation), the window's */
+    float rot[4];               /* the window's clip space into the images' (k_vs) */
+    uint32_t nimg, idx;
+    VkImage *img;               /* nimg each */
+    VkImageView *view;
+    VkSemaphore *drawn;         /* its pass done: what its present waits for */
+    bool stale;                 /* out of date: made again at the next begin */
+    bool follows;               /* its transform is the panel's: SUBOPTIMAL means it turned */
+    /* the frame shown */
+    HleDispFrame f;
+    bool have, using;           /* f held; inside hle_disp_use_begin */
+    uint64_t serial;            /* frames taken */
+    /* FXAA's image (the frame's size), FSR's (the frame's in the window) */
+    PsImg fx, up;
+    /* the display's gamma ramp */
+    uint8_t ramp[3][256];
+    uint32_t ramp_gen;
+    /* the last present went through, of f (have), the ramp and the caller's
+     * key (hle_present_unchanged) */
+    bool shown;
+    uint64_t shown_key;
+    /* a picture of the next refresh (hle_present_shot): its image copied
+     * into buf after the pass */
+    char shot_path[512];
+    bool shot_want, shot_can;   /* asked; the images can be copied from */
+    VkBuffer shot_buf;
+    VkDeviceMemory shot_mem;
+    VkDeviceSize shot_size;
+} g_ps;
+
+#ifdef _WIN32
+/* the game's frame's pictures (hle_present_set_remote, vk/share.h): its
+ * D3D12 images and fences, imported */
+static struct {
+    bool want, on, failed, checked;
+    char token[64];
+    HANDLE map, ev, frame;      /* the block, its event, the frame's process (its handles) */
+    HANDLE freed_ev;            /* our source's freed moved */
+    HleShare *sh;
+    int slot;                   /* our source in the block */
+    int64_t order, gen;
+    uint32_t w, h;
+    VkImage img[HLE_SHARE_IMAGES];
+    VkDeviceMemory mem[HLE_SHARE_IMAGES];
+    VkImageView view[HLE_SHARE_IMAGES];
+    uint64_t val[HLE_SHARE_IMAGES];   /* the picture last drawn into each */
+    VkSemaphore ready;          /* the frame's fence: our pictures drawn (v) */
+    uint64_t v;                 /* pictures so far */
+    uint32_t next;
+} g_rm;
+#endif
+
+/* ---- shaders ---- */
+
+/* rect: x0, y0, x1, y1 in the window's clip space; rot: that space turned
+ * into the image's (the panel's orientation: pre-rotated), x' = rot.x x +
+ * rot.y y, y' = rot.z x + rot.w y */
+static const char k_vs[] =
+    "#version 450\n"
+    "layout(push_constant) uniform P { vec4 rect; vec4 extra; vec4 rot; } pc;\n"
+    "layout(location = 0) out vec2 v_uv;\n"
+    "void main() {\n"
+    "  vec2 c = vec2(gl_VertexIndex & 1, gl_VertexIndex >> 1);\n"
+    "  v_uv = c;\n"
+    "  vec2 p = mix(pc.rect.xy, pc.rect.zw, c);\n"
+    "  gl_Position = vec4(pc.rot.x * p.x + pc.rot.y * p.y, pc.rot.z * p.x + pc.rot.w * p.y, 0.0, 1.0);\n"
+    "}\n";
+/* every fragment shader's start: its inputs and the gamma ramp (768 bytes,
+ * a channel's 256 after another's, as gamma.c's) */
+static const char k_fs_head[] =
+    "#version 450\n"
+    "layout(push_constant) uniform P { vec4 rect; vec4 extra; vec4 rot; } pc;\n"
+    "layout(set = 0, binding = 0) uniform sampler2D u_tex;\n"
+    "layout(set = 0, binding = 1, std140) uniform G { uvec4 w[48]; } g;\n"
+    "layout(location = 0) in vec2 v_uv;\n"
+    "layout(location = 0) out vec4 o;\n"
+    "uint lut(uint i) {\n"
+    "  uint word = g.w[i >> 4][(i >> 2) & 3u];\n"
+    "  return (word >> ((i & 3u) * 8u)) & 0xFFu;\n"
+    "}\n"
+    "vec4 ramp(vec3 c) {\n"
+    "  uvec3 v = uvec3(clamp(c, 0.0, 1.0) * 255.0 + 0.5);\n"
+    "  return vec4(float(lut(v.r)), float(lut(256u + v.g)), float(lut(512u + v.b)), 255.0) / 255.0;\n"
+    "}\n";
+static const char k_fs_bilinear[] =
+    "void main() {\n"
+    "  o = ramp(texture(u_tex, v_uv).rgb);\n"
+    "}\n";
+/* Down: each window pixel covers extra.xy frame pixels (at most 6 a side
+ * counted), each weighted by how much of it it covers: a box filter (on an
+ * axis scaled up, 1 pixel wide: the same as bilinear). */
+static const char k_fs_area[] =
+    "void main() {\n"
+    "  vec2 size = vec2(textureSize(u_tex, 0));\n"
+    "  vec2 r = clamp(pc.extra.xy, vec2(1.0), vec2(6.0));\n"
+    "  vec2 lo = v_uv * size - 0.5 * r, hi = lo + r;\n"
+    "  ivec2 i0 = ivec2(floor(lo)), i1 = ivec2(ceil(hi)) - 1, top = ivec2(size) - 1;\n"
+    "  vec3 sum = vec3(0.0);\n"
+    "  float wsum = 0.0;\n"
+    "  for (int y = i0.y; y <= i1.y; y++) {\n"
+    "    float wy = min(hi.y, float(y + 1)) - max(lo.y, float(y));\n"
+    "    for (int x = i0.x; x <= i1.x; x++) {\n"
+    "      float w = (min(hi.x, float(x + 1)) - max(lo.x, float(x))) * wy;\n"
+    "      sum += w * texelFetch(u_tex, clamp(ivec2(x, y), ivec2(0), top), 0).rgb;\n"
+    "      wsum += w;\n"
+    "    }\n"
+    "  }\n"
+    "  o = ramp(sum / wsum);\n"
+    "}\n";
+/* A CRT's look (hle_present_set_crt): the frame's lines as scanlines (a
+ * gaussian beam across each source line, wider where brighter), a phosphor
+ * mask on the window's pixels, the tube's curve and its darker corners.
+ * extra.x: the kind (1 soft scanlines, 2 a TV, 3 an arcade monitor),
+ * extra.y: the render scale (the console's lines are the frame's / it).
+ * Lines under ~2 window pixels each fade to flat: finer, they'd beat with
+ * the pixel rows into waves where the tube curves. */
+static const char k_fs_crt[] =
+    "void main() {\n"
+    "  int kind = int(pc.extra.x + 0.5);\n"
+    "  float scan = kind == 1 ? 0.30 : kind == 2 ? 0.50 : 0.65;\n"
+    "  float maskk = kind == 1 ? 0.0 : kind == 2 ? 0.12 : 0.22;\n"
+    "  float curve = kind == 1 ? 0.0 : kind == 2 ? 0.035 : 0.06;\n"
+    "  vec2 uv = v_uv;\n"
+    "  vec2 cc = uv * 2.0 - 1.0;\n"
+    "  cc *= 1.0 + curve * dot(cc, cc) * vec2(1.0, 1.25);\n"
+    "  uv = cc * 0.5 + 0.5;\n"
+    "  if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) { o = vec4(0.0, 0.0, 0.0, 1.0); return; }\n"
+    "  vec2 size = vec2(textureSize(u_tex, 0)) / vec2(1.0, max(pc.extra.y, 1.0));\n"
+    "  float y = uv.y * size.y - 0.5;\n"
+    "  float dy = fwidth(y);\n"
+    "  scan *= smoothstep(1.2, 2.2, 1.0 / max(dy, 1e-4));\n"
+    "  /* the beam (brighter lines are wider), filtered over the pixel and its\n"
+    "   * neighbours' halves (a tent, eight samples): lines of 2-4 pixels beat\n"
+    "   * with the pixel rows where the tube curves (moire, #151). Under 4.5\n"
+    "   * pixels a line, the beam's profile goes to a cosine through its peak\n"
+    "   * and trough (its sharper shape's harmonics fold into waves there) */\n"
+    "  float soft = 1.0 - smoothstep(2.5, 4.5, 1.0 / max(dy, 1e-4));\n"
+    "  vec3 lit = vec3(0.0);\n"
+    "  float wsum = 0.0;\n"
+    "  for (int k = 0; k < 8; k++) {\n"
+    "    float t = (float(k) + 0.5) * 0.25 - 1.0;\n"
+    "    float wt = 1.0 - abs(t);\n"
+    "    float ys = y + dy * t;\n"
+    "    float fy = fract(ys);\n"
+    "    vec2 at0 = vec2(uv.x, (floor(ys) + 0.5) / size.y), at1 = at0 + vec2(0.0, 1.0 / size.y);\n"
+    "    vec3 c0 = texture(u_tex, at0).rgb, c1 = texture(u_tex, at1).rgb;\n"
+    "    vec3 w0 = exp(-pow(fy / (0.32 + 0.22 * c0), vec3(2.0)) * 2.0);\n"
+    "    vec3 w1 = exp(-pow((1.0 - fy) / (0.32 + 0.22 * c1), vec3(2.0)) * 2.0);\n"
+    "    vec3 cm = mix(c0, c1, fy), sm = 0.32 + 0.22 * cm;\n"
+    "    vec3 pk = 1.0 + exp(-2.0 / (sm * sm)), tr = 2.0 * exp(-0.5 / (sm * sm));\n"
+    "    vec3 cs = cm * (0.5 * (pk + tr) + 0.5 * (pk - tr) * cos(6.2831853 * fy));\n"
+    "    lit += mix(c0 * w0 + c1 * w1, cs, soft) * wt;\n"
+    "    wsum += wt;\n"
+    "  }\n"
+    "  lit /= wsum;\n"
+    "  vec3 flat_ = texture(u_tex, uv).rgb;\n"
+    "  vec3 col = mix(flat_, lit * 1.35, scan);\n"
+    "  /* the mask: an aperture grille's stripes, R G B */\n"
+    "  int m = int(gl_FragCoord.x) % 3;\n"
+    "  vec3 mask = vec3(m == 0 ? 1.0 : 1.0 - maskk, m == 1 ? 1.0 : 1.0 - maskk, m == 2 ? 1.0 : 1.0 - maskk);\n"
+    "  col *= mask * (1.0 + maskk * 0.9);\n"
+    "  /* the corners */\n"
+    "  float vig = kind == 1 ? 1.0 : clamp(pow(16.0 * uv.x * uv.y * (1.0 - uv.x) * (1.0 - uv.y), 0.18), 0.0, 1.0);\n"
+    "  o = ramp(col * vig);\n"
+    "}\n";
+/* The frame rate in a corner (hle_present_set_osd): four seven-segment
+ * digits, green on dark, drawn by the shader alone. extra.x: the number. */
+static const char k_fs_osd[] =
+    "float seg(vec2 p, int m) {\n"
+    "  const float t = 0.07;\n"
+    "  bool h = p.x > 0.22 && p.x < 0.78, u = p.y > 0.12 && p.y < 0.5, d = p.y > 0.5 && p.y < 0.88;\n"
+    "  if ((m & 1) != 0 && abs(p.y - 0.12) < t && h) return 1.0;\n"
+    "  if ((m & 2) != 0 && abs(p.x - 0.78) < t && u) return 1.0;\n"
+    "  if ((m & 4) != 0 && abs(p.x - 0.78) < t && d) return 1.0;\n"
+    "  if ((m & 8) != 0 && abs(p.y - 0.88) < t && h) return 1.0;\n"
+    "  if ((m & 16) != 0 && abs(p.x - 0.22) < t && d) return 1.0;\n"
+    "  if ((m & 32) != 0 && abs(p.x - 0.22) < t && u) return 1.0;\n"
+    "  if ((m & 64) != 0 && abs(p.y - 0.5) < t && h) return 1.0;\n"
+    "  return 0.0;\n"
+    "}\n"
+    "void main() {\n"
+    "  const int SEG[10] = int[10](0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F);\n"
+    "  int n = int(pc.extra.x + 0.5);\n"
+    "  int cell = int(v_uv.x * 4.0);\n"
+    "  int pw = 1;\n"
+    "  for (int i = 0; i < 3 - cell; i++) pw *= 10;\n"
+    "  int digit = (n / pw) % 10;\n"
+    "  bool lead = n < pw && cell < 3;\n"
+    "  float on = lead ? 0.0 : seg(vec2(fract(v_uv.x * 4.0), v_uv.y), SEG[digit]);\n"
+    "  o = mix(vec4(0.02, 0.07, 0.01, 1.0), vec4(0.55, 0.95, 0.16, 1.0), on);\n"
+    "}\n";
+/* The overlay's blur of the picture (HLE_OV_SCENE_BLUR): the dual filter
+ * (Marius Bjorge, "Bandwidth-efficient rendering", SIGGRAPH 2015), halving
+ * down a chain of images and doubling back up, five taps down and eight up
+ * each. extra.xy: the offset, a texel of the image read (down) or of the
+ * one drawn (up). No ramp: the picture has it. */
+static const char k_fs_kdown[] =
+    "void main() {\n"
+    "  vec2 h = pc.extra.xy;\n"
+    "  vec3 s = texture(u_tex, v_uv).rgb * 4.0 + texture(u_tex, v_uv - h).rgb + texture(u_tex, v_uv + h).rgb +\n"
+    "           texture(u_tex, v_uv + vec2(h.x, -h.y)).rgb + texture(u_tex, v_uv - vec2(h.x, -h.y)).rgb;\n"
+    "  o = vec4(s / 8.0, 1.0);\n"
+    "}\n";
+static const char k_fs_kup[] =
+    "void main() {\n"
+    "  vec2 h = pc.extra.xy;\n"
+    "  vec3 s = texture(u_tex, v_uv + vec2(-h.x * 2.0, 0.0)).rgb + texture(u_tex, v_uv + vec2(0.0, h.y * 2.0)).rgb +\n"
+    "           texture(u_tex, v_uv + vec2(h.x * 2.0, 0.0)).rgb + texture(u_tex, v_uv + vec2(0.0, -h.y * 2.0)).rgb +\n"
+    "           (texture(u_tex, v_uv + vec2(-h.x, h.y)).rgb + texture(u_tex, v_uv + vec2(h.x, h.y)).rgb +\n"
+    "            texture(u_tex, v_uv + vec2(h.x, -h.y)).rgb + texture(u_tex, v_uv + vec2(-h.x, -h.y)).rgb) * 2.0;\n"
+    "  o = vec4(s / 12.0, 1.0);\n"
+    "}\n";
+/* The overlay's triangles (HleOvVert): window pixels into clip space
+ * (rect.xy: 2 / the window's size), turned as the window's (rot); texel
+ * times colour. */
+static const char k_vs_ov[] =
+    "#version 450\n"
+    "layout(push_constant) uniform P { vec4 rect; vec4 extra; vec4 rot; } pc;\n"
+    "layout(location = 0) in vec2 a_pos;\n"
+    "layout(location = 1) in vec2 a_uv;\n"
+    "layout(location = 2) in vec4 a_col;\n"
+    "layout(location = 0) out vec2 v_uv;\n"
+    "layout(location = 1) out vec4 v_col;\n"
+    "void main() {\n"
+    "  v_uv = a_uv;\n"
+    "  v_col = a_col;\n"
+    "  vec2 p = a_pos * pc.rect.xy - 1.0;\n"
+    "  gl_Position = vec4(pc.rot.x * p.x + pc.rot.y * p.y, pc.rot.z * p.x + pc.rot.w * p.y, 0.0, 1.0);\n"
+    "}\n";
+static const char k_fs_ov[] =
+    "#version 450\n"
+    "layout(set = 0, binding = 0) uniform sampler2D u_tex;\n"
+    "layout(location = 0) in vec2 v_uv;\n"
+    "layout(location = 1) in vec4 v_col;\n"
+    "layout(location = 0) out vec4 o;\n"
+    "void main() {\n"
+    "  o = texture(u_tex, v_uv) * v_col;\n"
+    "}\n";
+/* FXAA 3.11 Quality as PCSX2 tunes it (edges only: no subpixel blur), into
+ * a frame-sized image: no ramp yet. */
+static const char k_fs_fxaa[] =
+    "const float EDGE_THRESHOLD = 0.063, EDGE_THRESHOLD_MIN = 0.0, SUBPIX = 0.0;\n"
+    "const float STEP[12] = float[12](1.5, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0, 8.0);\n"
+    "float luma(vec3 c) { return dot(c, vec3(0.2126729, 0.7151522, 0.0721750)); }\n"
+    "float luma_at(vec2 p) { return luma(textureLod(u_tex, p, 0.0).rgb); }\n"
+    "#define LUMA_OFF(x, y) luma(textureLodOffset(u_tex, posM, 0.0, ivec2(x, y)).rgb)\n"
+    "void main() {\n"
+    "  vec2 rcp = 1.0 / vec2(textureSize(u_tex, 0));\n"
+    "  vec2 posM = v_uv;\n"
+    "  vec3 rgbM = textureLod(u_tex, posM, 0.0).rgb;\n"
+    "  float lumaM = luma(rgbM);\n"
+    "  float lumaS = LUMA_OFF(0, 1), lumaE = LUMA_OFF(1, 0), lumaN = LUMA_OFF(0, -1), lumaW = LUMA_OFF(-1, 0);\n"
+    "  float rangeMax = max(max(lumaN, lumaW), max(lumaE, max(lumaS, lumaM)));\n"
+    "  float rangeMin = min(min(lumaN, lumaW), min(lumaE, min(lumaS, lumaM)));\n"
+    "  float range = rangeMax - rangeMin;\n"
+    "  if (range < max(EDGE_THRESHOLD_MIN, rangeMax * EDGE_THRESHOLD)) {\n"
+    "    o = vec4(rgbM, 1.0);\n"
+    "    return;\n"
+    "  }\n"
+    "  float lumaNW = LUMA_OFF(-1, -1), lumaSE = LUMA_OFF(1, 1), lumaNE = LUMA_OFF(1, -1), lumaSW = LUMA_OFF(-1, 1);\n"
+    "  float lumaNS = lumaN + lumaS, lumaWE = lumaW + lumaE;\n"
+    "  float edgeHorz = abs(-2.0 * lumaW + lumaNW + lumaSW) + 2.0 * abs(-2.0 * lumaM + lumaNS) +\n"
+    "                   abs(-2.0 * lumaE + lumaNE + lumaSE);\n"
+    "  float edgeVert = abs(-2.0 * lumaS + lumaSW + lumaSE) + 2.0 * abs(-2.0 * lumaM + lumaWE) +\n"
+    "                   abs(-2.0 * lumaN + lumaNW + lumaNE);\n"
+    "  bool horzSpan = edgeHorz >= edgeVert;\n"
+    "  float subpixA = 2.0 * (lumaNS + lumaWE) + (lumaNW + lumaSW + lumaNE + lumaSE);\n"
+    "  float lengthSign = horzSpan ? rcp.y : rcp.x;\n"
+    "  if (!horzSpan) {\n"
+    "    lumaN = lumaW;\n"
+    "    lumaS = lumaE;\n"
+    "  }\n"
+    "  float subpixB = subpixA * (1.0 / 12.0) - lumaM;\n"
+    "  float gradientN = lumaN - lumaM, gradientS = lumaS - lumaM;\n"
+    "  float lumaNN = lumaN + lumaM, lumaSS = lumaS + lumaM;\n"
+    "  bool pairN = abs(gradientN) >= abs(gradientS);\n"
+    "  float gradient = max(abs(gradientN), abs(gradientS));\n"
+    "  if (pairN) lengthSign = -lengthSign;\n"
+    "  float subpixC = clamp(abs(subpixB) / range, 0.0, 1.0);\n"
+    "  vec2 offNP = horzSpan ? vec2(rcp.x, 0.0) : vec2(0.0, rcp.y);\n"
+    "  vec2 posB = posM;\n"
+    "  if (horzSpan) posB.y += lengthSign * 0.5; else posB.x += lengthSign * 0.5;\n"
+    "  vec2 posN = posB - offNP, posP = posB + offNP;\n"
+    "  float subpixF = (-2.0 * subpixC + 3.0) * subpixC * subpixC;\n"
+    "  if (!pairN) lumaNN = lumaSS;\n"
+    "  float gradientScaled = gradient * 0.25;\n"
+    "  bool lumaMLTZero = lumaM - lumaNN * 0.5 < 0.0;\n"
+    "  float lumaEndN = luma_at(posN) - lumaNN * 0.5, lumaEndP = luma_at(posP) - lumaNN * 0.5;\n"
+    "  bool doneN = abs(lumaEndN) >= gradientScaled, doneP = abs(lumaEndP) >= gradientScaled;\n"
+    "  if (!doneN) posN -= offNP * STEP[0];\n"
+    "  if (!doneP) posP += offNP * STEP[0];\n"
+    "  for (int i = 1; i < 12 && !(doneN && doneP); i++) {\n"
+    "    if (!doneN) lumaEndN = luma_at(posN) - lumaNN * 0.5;\n"
+    "    if (!doneP) lumaEndP = luma_at(posP) - lumaNN * 0.5;\n"
+    "    doneN = abs(lumaEndN) >= gradientScaled;\n"
+    "    doneP = abs(lumaEndP) >= gradientScaled;\n"
+    "    if (!doneN) posN -= offNP * STEP[i];\n"
+    "    if (!doneP) posP += offNP * STEP[i];\n"
+    "  }\n"
+    "  float dstN = horzSpan ? posM.x - posN.x : posM.y - posN.y;\n"
+    "  float dstP = horzSpan ? posP.x - posM.x : posP.y - posM.y;\n"
+    "  bool goodSpan = dstN < dstP ? (lumaEndN < 0.0) != lumaMLTZero : (lumaEndP < 0.0) != lumaMLTZero;\n"
+    "  float pixelOffset = goodSpan ? 0.5 - min(dstN, dstP) / (dstN + dstP) : 0.0;\n"
+    "  float offset = max(pixelOffset, subpixF * subpixF * SUBPIX);\n"
+    "  if (horzSpan) posM.y += offset * lengthSign; else posM.x += offset * lengthSign;\n"
+    "  o = vec4(textureLod(u_tex, posM, 0.0).rgb, 1.0);\n"
+    "}\n";
+/* AMD FidelityFX Super Resolution 1 (ffx_fsr1.h, its 32-bit FsrEasuF and
+ * FsrRcasF), MIT: licenses/amd-fsr1.license.txt. EASU draws into an image
+ * of the frame's size in the window: extra = the frame's width and height,
+ * the image's. Its reciprocal approximations are exact ones here, kept from
+ * dividing by zero. */
+static const char k_fs_easu[] =
+    "// Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved. (MIT)\n"
+    "void easuSet(inout vec2 dir, inout float len, float w, float lA, float lB, float lC, float lD,\n"
+    "             float lE) {\n"
+    "  float lenX = 1.0 / max(max(abs(lD - lC), abs(lC - lB)), 1e-8);\n"
+    "  float dirX = lD - lB;\n"
+    "  dir.x += dirX * w;\n"
+    "  lenX = clamp(abs(dirX) * lenX, 0.0, 1.0);\n"
+    "  len += lenX * lenX * w;\n"
+    "  float lenY = 1.0 / max(max(abs(lE - lC), abs(lC - lA)), 1e-8);\n"
+    "  float dirY = lE - lA;\n"
+    "  dir.y += dirY * w;\n"
+    "  lenY = clamp(abs(dirY) * lenY, 0.0, 1.0);\n"
+    "  len += lenY * lenY * w;\n"
+    "}\n"
+    "void easuTap(inout vec3 aC, inout float aW, vec2 off, vec2 dir, vec2 len, float lob, float clp,\n"
+    "             vec3 c) {\n"
+    "  vec2 v = vec2(off.x * dir.x + off.y * dir.y, off.x * -dir.y + off.y * dir.x) * len;\n"
+    "  float d2 = min(dot(v, v), clp);\n"
+    "  float wB = 2.0 / 5.0 * d2 - 1.0;\n"
+    "  float wA = lob * d2 - 1.0;\n"
+    "  wB *= wB;\n"
+    "  wA *= wA;\n"
+    "  wB = 25.0 / 16.0 * wB - (25.0 / 16.0 - 1.0);\n"
+    "  float w = wB * wA;\n"
+    "  aC += c * w;\n"
+    "  aW += w;\n"
+    "}\n"
+    "void main() {\n"
+    "  vec2 inSz = pc.extra.xy, outSz = pc.extra.zw, rin = 1.0 / inSz;\n"
+    "  vec2 pp = floor(gl_FragCoord.xy) * (inSz / outSz) + (0.5 * inSz / outSz - 0.5);\n"
+    "  vec2 fp = floor(pp);\n"
+    "  pp -= fp;\n"
+    "  vec2 p0 = fp * rin + vec2(1.0, -1.0) * rin;\n"
+    "  vec2 p1 = p0 + vec2(-1.0, 2.0) * rin;\n"
+    "  vec2 p2 = p0 + vec2(1.0, 2.0) * rin;\n"
+    "  vec2 p3 = p0 + vec2(0.0, 4.0) * rin;\n"
+    "  vec4 bczzR = textureGather(u_tex, p0, 0), bczzG = textureGather(u_tex, p0, 1),\n"
+    "       bczzB = textureGather(u_tex, p0, 2);\n"
+    "  vec4 ijfeR = textureGather(u_tex, p1, 0), ijfeG = textureGather(u_tex, p1, 1),\n"
+    "       ijfeB = textureGather(u_tex, p1, 2);\n"
+    "  vec4 klhgR = textureGather(u_tex, p2, 0), klhgG = textureGather(u_tex, p2, 1),\n"
+    "       klhgB = textureGather(u_tex, p2, 2);\n"
+    "  vec4 zzonR = textureGather(u_tex, p3, 0), zzonG = textureGather(u_tex, p3, 1),\n"
+    "       zzonB = textureGather(u_tex, p3, 2);\n"
+    "  vec4 bczzL = bczzB * 0.5 + (bczzR * 0.5 + bczzG);\n"
+    "  vec4 ijfeL = ijfeB * 0.5 + (ijfeR * 0.5 + ijfeG);\n"
+    "  vec4 klhgL = klhgB * 0.5 + (klhgR * 0.5 + klhgG);\n"
+    "  vec4 zzonL = zzonB * 0.5 + (zzonR * 0.5 + zzonG);\n"
+    "  float bL = bczzL.x, cL = bczzL.y, iL = ijfeL.x, jL = ijfeL.y, fL = ijfeL.z, eL = ijfeL.w;\n"
+    "  float kL = klhgL.x, lL = klhgL.y, hL = klhgL.z, gL = klhgL.w, oL = zzonL.z, nL = zzonL.w;\n"
+    "  vec2 dir = vec2(0.0);\n"
+    "  float len = 0.0;\n"
+    "  easuSet(dir, len, (1.0 - pp.x) * (1.0 - pp.y), bL, eL, fL, gL, jL);\n"
+    "  easuSet(dir, len, pp.x * (1.0 - pp.y), cL, fL, gL, hL, kL);\n"
+    "  easuSet(dir, len, (1.0 - pp.x) * pp.y, fL, iL, jL, kL, nL);\n"
+    "  easuSet(dir, len, pp.x * pp.y, gL, jL, kL, lL, oL);\n"
+    "  vec2 dir2 = dir * dir;\n"
+    "  float dirR = dir2.x + dir2.y;\n"
+    "  bool zro = dirR < 1.0 / 32768.0;\n"
+    "  dirR = zro ? 1.0 : inversesqrt(dirR);\n"
+    "  dir.x = zro ? 1.0 : dir.x;\n"
+    "  dir *= dirR;\n"
+    "  len = len * 0.5;\n"
+    "  len *= len;\n"
+    "  float stretch = dot(dir, dir) / max(abs(dir.x), abs(dir.y));\n"
+    "  vec2 len2 = vec2(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);\n"
+    "  float lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;\n"
+    "  float clp = 1.0 / lob;\n"
+    "  vec3 f = vec3(ijfeR.z, ijfeG.z, ijfeB.z), g = vec3(klhgR.w, klhgG.w, klhgB.w);\n"
+    "  vec3 j = vec3(ijfeR.y, ijfeG.y, ijfeB.y), k = vec3(klhgR.x, klhgG.x, klhgB.x);\n"
+    "  vec3 min4 = min(min(f, g), min(j, k)), max4 = max(max(f, g), max(j, k));\n"
+    "  vec3 aC = vec3(0.0);\n"
+    "  float aW = 0.0;\n"
+    "  easuTap(aC, aW, vec2(0.0, -1.0) - pp, dir, len2, lob, clp, vec3(bczzR.x, bczzG.x, bczzB.x));\n"
+    "  easuTap(aC, aW, vec2(1.0, -1.0) - pp, dir, len2, lob, clp, vec3(bczzR.y, bczzG.y, bczzB.y));\n"
+    "  easuTap(aC, aW, vec2(-1.0, 1.0) - pp, dir, len2, lob, clp, vec3(ijfeR.x, ijfeG.x, ijfeB.x));\n"
+    "  easuTap(aC, aW, vec2(0.0, 1.0) - pp, dir, len2, lob, clp, j);\n"
+    "  easuTap(aC, aW, vec2(0.0, 0.0) - pp, dir, len2, lob, clp, f);\n"
+    "  easuTap(aC, aW, vec2(-1.0, 0.0) - pp, dir, len2, lob, clp, vec3(ijfeR.w, ijfeG.w, ijfeB.w));\n"
+    "  easuTap(aC, aW, vec2(1.0, 1.0) - pp, dir, len2, lob, clp, k);\n"
+    "  easuTap(aC, aW, vec2(2.0, 1.0) - pp, dir, len2, lob, clp, vec3(klhgR.y, klhgG.y, klhgB.y));\n"
+    "  easuTap(aC, aW, vec2(2.0, 0.0) - pp, dir, len2, lob, clp, vec3(klhgR.z, klhgG.z, klhgB.z));\n"
+    "  easuTap(aC, aW, vec2(1.0, 0.0) - pp, dir, len2, lob, clp, g);\n"
+    "  easuTap(aC, aW, vec2(1.0, 2.0) - pp, dir, len2, lob, clp, vec3(zzonR.z, zzonG.z, zzonB.z));\n"
+    "  easuTap(aC, aW, vec2(0.0, 2.0) - pp, dir, len2, lob, clp, vec3(zzonR.w, zzonG.w, zzonB.w));\n"
+    "  o = vec4(min(max4, max(min4, aC / aW)), 1.0);\n"
+    "}\n";
+/* RCAS, over EASU's image on its way into the window (its pixels the
+ * window's, one for one): extra.x the sharpness, 2^-stops (FsrRcasCon). */
+static const char k_fs_rcas[] =
+    "// Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved. (MIT)\n"
+    "vec3 at(ivec2 p, ivec2 top) { return texelFetch(u_tex, clamp(p, ivec2(0), top), 0).rgb; }\n"
+    "void main() {\n"
+    "  ivec2 top = textureSize(u_tex, 0) - 1;\n"
+    "  ivec2 sp = clamp(ivec2(v_uv * vec2(top + 1)), ivec2(0), top);\n"
+    "  vec3 b = at(sp + ivec2(0, -1), top), d = at(sp + ivec2(-1, 0), top), e = at(sp, top);\n"
+    "  vec3 f = at(sp + ivec2(1, 0), top), h = at(sp + ivec2(0, 1), top);\n"
+    "  vec3 mn4 = min(min(b, d), min(f, h)), mx4 = max(max(b, d), max(f, h));\n"
+    "  vec3 hitMin = min(mn4, e) / max(4.0 * mx4, vec3(1e-6));\n"
+    "  vec3 hitMax = (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, vec3(-1e-6));\n"
+    "  vec3 lobeC = max(-hitMin, hitMax);\n"
+    "  float lobe = max(-(0.25 - 1.0 / 16.0), min(max(lobeC.r, max(lobeC.g, lobeC.b)), 0.0)) * pc.extra.x;\n"
+    "  o = ramp((lobe * (b + d + h + f) + e) / (4.0 * lobe + 1.0));\n"
+    "}\n";
+
+static VkShaderModule module(HleShaderStage stage, const char *head, const char *body)
+{
+    g_autofree char *src = g_strdup_printf("%s%s", head, body);
+    size_t n = 0;
+    g_autofree uint32_t *spv = hle_glsl_compile(stage, src, &n);
+    VkShaderModule m = VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                    .codeSize = n * 4, .pCode = spv };
+    if (spv && T.vkCreateShaderModule(g_hvk.dev, &ci, NULL, &m) != VK_SUCCESS) {
+        m = VK_NULL_HANDLE;
+    }
+    return m;
+}
+
+static VkPipeline pipeline(VkShaderModule fs, VkFormat fmt)
+{
+    if (!g_ps.vs || !fs) {
+        return VK_NULL_HANDLE;
+    }
+    VkPipelineShaderStageCreateInfo st[2] = {
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = g_ps.vs, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "main" } };
+    VkPipelineVertexInputStateCreateInfo vi = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo ia = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP };
+    VkPipelineViewportStateCreateInfo vp = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1, .scissorCount = 1 };
+    VkPipelineRasterizationStateCreateInfo rs = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1.0f };
+    VkPipelineMultisampleStateCreateInfo ms = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+    VkPipelineColorBlendAttachmentState ba = { .colorWriteMask = 0xF };
+    VkPipelineColorBlendStateCreateInfo cb = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = 1, .pAttachments = &ba };
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo ds = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = 2, .pDynamicStates = dyn };
+    VkPipelineRenderingCreateInfo rci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+        .colorAttachmentCount = 1, .pColorAttachmentFormats = &fmt };
+    VkGraphicsPipelineCreateInfo gci = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &rci,
+        .stageCount = 2, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+        .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms,
+        .pColorBlendState = &cb, .pDynamicState = &ds, .layout = g_ps.pl };
+    VkPipeline p = VK_NULL_HANDLE;
+    if (T.vkCreateGraphicsPipelines(g_hvk.dev, VK_NULL_HANDLE, 1, &gci, NULL, &p) != VK_SUCCESS) {
+        p = VK_NULL_HANDLE;
+    }
+    return p;
+}
+
+/* ---- setup ---- */
+
+static bool init(void)
+{
+    volkLoadDeviceTable(&g_ps.t, g_hvk.dev);
+    hle_compat_install(&g_ps.t);        /* below 1.3: as the back end's table */
+    VkSemaphoreTypeCreateInfo tci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+                                      .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE };
+    VkSemaphoreCreateInfo tsi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &tci };
+    VkSamplerCreateInfo sci = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = 0.0f };
+    VkDescriptorSetLayoutBinding b[2] = {
+        { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
+        { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL } };
+    VkDescriptorSetLayoutCreateInfo dci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = b };
+    if (T.vkCreateSemaphore(g_hvk.dev, &tsi, NULL, &g_ps.tl) != VK_SUCCESS ||
+        T.vkCreateSampler(g_hvk.dev, &sci, NULL, &g_ps.smp) != VK_SUCCESS ||
+        T.vkCreateSampler(g_hvk.dev, &(VkSamplerCreateInfo){ .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+                                                              .magFilter = VK_FILTER_NEAREST,
+                                                              .minFilter = VK_FILTER_NEAREST,
+                                                              .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                                              .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                                              .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                                              .maxLod = 0.0f },
+                          NULL, &g_ps.smp_near) != VK_SUCCESS ||
+        T.vkCreateDescriptorSetLayout(g_hvk.dev, &dci, NULL, &g_ps.dsl) != VK_SUCCESS) {
+        return false;
+    }
+    VkPushConstantRange pcr = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48 };
+    VkPipelineLayoutCreateInfo lci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+        .pSetLayouts = &g_ps.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
+    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, PS_FRAMES * PS_SETS },
+                                   { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, PS_FRAMES * PS_SETS } };
+    VkDescriptorPoolCreateInfo pci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = PS_FRAMES * PS_SETS,
+        .poolSizeCount = 2, .pPoolSizes = ps };
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = PS_FRAMES * PS_RAMP,
+                               .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT };
+    if (T.vkCreatePipelineLayout(g_hvk.dev, &lci, NULL, &g_ps.pl) != VK_SUCCESS ||
+        T.vkCreateDescriptorPool(g_hvk.dev, &pci, NULL, &g_ps.dp) != VK_SUCCESS ||
+        T.vkCreateBuffer(g_hvk.dev, &bci, NULL, &g_ps.ubo) != VK_SUCCESS) {
+        return false;
+    }
+    VkMemoryRequirements mr;
+    T.vkGetBufferMemoryRequirements(g_hvk.dev, g_ps.ubo, &mr);
+    int mt = hle_vk_memtype(mr.memoryTypeBits,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt };
+    if (mt < 0 || T.vkAllocateMemory(g_hvk.dev, &mai, NULL, &g_ps.ubo_mem) != VK_SUCCESS ||
+        T.vkBindBufferMemory(g_hvk.dev, g_ps.ubo, g_ps.ubo_mem, 0) != VK_SUCCESS ||
+        T.vkMapMemory(g_hvk.dev, g_ps.ubo_mem, 0, VK_WHOLE_SIZE, 0, (void **)&g_ps.ubo_map) != VK_SUCCESS) {
+        return false;
+    }
+    for (unsigned i = 0; i < 256; i++) {
+        g_ps.ramp[0][i] = g_ps.ramp[1][i] = g_ps.ramp[2][i] = (uint8_t)i;
+    }
+    for (unsigned i = 0; i < PS_FRAMES; i++) {
+        PsFrame *f = &g_ps.fr[i];
+        VkCommandPoolCreateInfo cpi = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+                                        .queueFamilyIndex = g_hvk.qfam };
+        VkSemaphoreCreateInfo si = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        VkDescriptorSetLayout l[PS_SETS] = { g_ps.dsl, g_ps.dsl, g_ps.dsl, g_ps.dsl };
+        VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                            .descriptorPool = g_ps.dp, .descriptorSetCount = PS_SETS,
+                                            .pSetLayouts = l };
+        if (T.vkCreateCommandPool(g_hvk.dev, &cpi, NULL, &f->pool) != VK_SUCCESS ||
+            T.vkCreateSemaphore(g_hvk.dev, &si, NULL, &f->acquired) != VK_SUCCESS ||
+            T.vkAllocateDescriptorSets(g_hvk.dev, &dai, f->set) != VK_SUCCESS) {
+            return false;
+        }
+        VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                           .commandPool = f->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                           .commandBufferCount = 1 };
+        if (T.vkAllocateCommandBuffers(g_hvk.dev, &ai, &f->cb) != VK_SUCCESS) {
+            return false;
+        }
+        f->ramp_stale = true;
+    }
+    g_ps.vs = module(HLE_SHADER_VERTEX, k_vs, "");
+    static const char *const body[P_COUNT] = { k_fs_bilinear, k_fs_area, k_fs_rcas, k_fs_crt, k_fs_osd,
+                                               k_fs_kdown, k_fs_kup, k_fs_fxaa, k_fs_easu };
+    for (unsigned i = 0; i < P_COUNT; i++) {
+        g_ps.fs[i] = module(HLE_SHADER_FRAGMENT, k_fs_head, body[i]);
+    }
+    g_ps.pipe[P_FXAA] = pipeline(g_ps.fs[P_FXAA], VK_FORMAT_R8G8B8A8_UNORM);
+    g_ps.pipe[P_EASU] = pipeline(g_ps.fs[P_EASU], VK_FORMAT_R8G8B8A8_UNORM);
+    hle_log("xbased-hle-back", "present: ready (shaders: bilinear %d, averaging %d, FSR %d, FXAA %d)",
+            g_ps.fs[P_BILINEAR] != VK_NULL_HANDLE, g_ps.fs[P_AREA] != VK_NULL_HANDLE,
+            g_ps.fs[P_RCAS] != VK_NULL_HANDLE && g_ps.pipe[P_EASU] != VK_NULL_HANDLE,
+            g_ps.pipe[P_FXAA] != VK_NULL_HANDLE);
+    return g_ps.fs[P_BILINEAR] != VK_NULL_HANDLE;
+}
+
+/* Every submit of the presenter's done (the timeline), and with the queue
+ * idle its presents' waits too: what a swapchain or image being replaced
+ * may still be used by. */
+static void idle(void)
+{
+    if (hle_vk_lost()) {
+        return;                         /* nothing runs on it any more */
+    }
+    VkResult r = hle_tl_sem_wait(g_ps.tl, g_ps.submitted, 2000000000ull);
+    if (r != VK_TIMEOUT) {
+        hle_vk_check(r, "vkWaitSemaphores (present)");
+    }
+    hle_vk_queue_lock();
+    r = T.vkQueueWaitIdle(g_hvk.queue);
+    hle_vk_queue_unlock();
+    hle_vk_check(r, "vkQueueWaitIdle (present)");
+}
+
+static bool remote_images(void);
+
+static void drop_images(void)
+{
+    if (remote_images()) {
+        g_ps.img = NULL;    /* the frame's pictures' (static, freed by remote_drop) */
+        g_ps.view = NULL;
+        return;
+    }
+    for (uint32_t i = 0; i < g_ps.nimg; i++) {
+        T.vkDestroyImageView(g_hvk.dev, g_ps.view[i], NULL);
+        T.vkDestroySemaphore(g_hvk.dev, g_ps.drawn[i], NULL);
+    }
+    g_free(g_ps.img);
+    g_free(g_ps.view);
+    g_free(g_ps.drawn);
+    g_ps.img = NULL;
+    g_ps.view = NULL;
+    g_ps.drawn = NULL;
+    g_ps.nimg = 0;
+}
+
+/* The window gone, or another: its swapchain and surface go. */
+static void drop_window(void)
+{
+    g_ps.shown = false;
+    if (g_ps.sc || g_ps.surf) {
+        idle();
+    }
+    drop_images();
+    if (g_ps.sc) {
+        T.vkDestroySwapchainKHR(g_hvk.dev, g_ps.sc, NULL);
+        g_ps.sc = VK_NULL_HANDLE;
+    }
+    if (g_ps.surf) {
+        vkDestroySurfaceKHR(g_hvk.inst, g_ps.surf, NULL);
+        g_ps.surf = VK_NULL_HANDLE;
+    }
+    g_ps.win = NULL;
+}
+
+static bool g_vsync;               /* hle_present_set_vsync */
+
+static bool make_swapchain(uint32_t w, uint32_t h)
+{
+    VkSurfaceCapabilitiesKHR caps;
+    VkBool32 ok = VK_FALSE;
+    vkGetPhysicalDeviceSurfaceSupportKHR(g_hvk.phys, g_hvk.qfam, g_ps.surf, &ok);
+    if (!ok || vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_hvk.phys, g_ps.surf, &caps) != VK_SUCCESS) {
+        hle_log("xbased-hle-back", "present: the window's surface can't be presented to");
+        return false;
+    }
+    VkSurfaceFormatKHR fmts[32];
+    uint32_t nf = 32;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(g_hvk.phys, g_ps.surf, &nf, fmts);
+    /* plain 8-bit UNORM: the frame's values go out as they are (an sRGB
+     * format would encode them again) */
+    VkSurfaceFormatKHR fmt = nf ? fmts[0] : (VkSurfaceFormatKHR){ VK_FORMAT_R8G8B8A8_UNORM, 0 };
+    for (int pass = 0; pass < 2; pass++) {
+        const VkFormat want = pass ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
+        for (uint32_t i = 0; i < nf; i++) {
+            if (fmts[i].format == want && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+                fmt = fmts[i];
+                pass = 2;
+                break;
+            }
+        }
+    }
+    /* Android may make more images than asked for (10 for 6 on a Dimensity
+     * 8300), so the arrays are sized from what the swapchain reports. */
+    uint32_t n = MAX(caps.minImageCount, 3u);
+    if (caps.maxImageCount) {
+        n = MIN(n, caps.maxImageCount);
+    }
+    /* Pre-rotated: the images in the panel's own orientation (its transform
+     * now), the picture turned into them as it's drawn. An image in the
+     * window's orientation the compositor turns itself, with the GPU at every
+     * refresh (Odin 3 and RP5 panels are portrait): that composition took GPU
+     * time from the game, and the Odin 3 fell to its 60 Hz mode with it.
+     * Qualcomm's EGL had pre-rotated GL's buffers. */
+    static const VkSurfaceTransformFlagBitsKHR k_turns[4] = {
+        VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR, VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR,
+        VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR, VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR };
+    static const float k_rot[4][4] = { { 1, 0, 0, 1 }, { 0, -1, 1, 0 }, { -1, 0, 0, -1 }, { 0, 1, -1, 0 } };
+    unsigned turn = 0;
+    for (unsigned i = 0; i < 4; i++) {
+        if (caps.currentTransform == k_turns[i] && (caps.supportedTransforms & k_turns[i])) {
+            turn = i;
+        }
+    }
+    const VkSurfaceTransformFlagBitsKHR tf = k_turns[turn];
+    g_ps.follows = tf == caps.currentTransform;
+    memcpy(g_ps.rot, k_rot[turn], sizeof(g_ps.rot));
+    g_ps.wsize = (VkExtent2D){ w, h };
+    if (turn & 1) {
+        const uint32_t t = w;   /* a quarter turn: the panel's width is the window's height */
+        w = h;
+        h = t;
+    }
+    w = MIN(MAX(w, caps.minImageExtent.width), caps.maxImageExtent.width);
+    h = MIN(MAX(h, caps.minImageExtent.height), caps.maxImageExtent.height);
+    if (hle_quirk(HLE_QUIRK_SWAP_W32) && (w & ~31u) >= MAX(caps.minImageExtent.width, 32u)) {
+        w &= ~31u;                      /* older PowerVR drivers (quirks.h) */
+    }
+    VkCompositeAlphaFlagBitsKHR ca = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
+                                         ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+                                         : VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+    VkPresentModeKHR pm = VK_PRESENT_MODE_FIFO_KHR;
+    if (!g_vsync) {
+        uint32_t nm = 0;
+        VkPresentModeKHR modes[16];
+        if (vkGetPhysicalDeviceSurfacePresentModesKHR(g_hvk.phys, g_ps.surf, &nm, NULL) == VK_SUCCESS) {
+            nm = MIN(nm, 16u);
+            vkGetPhysicalDeviceSurfacePresentModesKHR(g_hvk.phys, g_ps.surf, &nm, modes);
+        }
+        for (uint32_t i = 0; i < nm; i++) {
+            if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+                pm = modes[i];
+            } else if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR && pm == VK_PRESENT_MODE_FIFO_KHR) {
+                pm = modes[i];
+            }
+        }
+    }
+    VkSwapchainKHR old = g_ps.sc;
+    if (old) {
+        idle();
+    }
+    g_ps.shot_can = (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
+    VkSwapchainCreateInfoKHR ci = {
+        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = g_ps.surf,
+        .minImageCount = n, .imageFormat = fmt.format, .imageColorSpace = fmt.colorSpace,
+        .imageExtent = { w, h }, .imageArrayLayers = 1,
+        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                      (g_ps.shot_can ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0),
+        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = tf, .compositeAlpha = ca,
+        .presentMode = pm, .clipped = VK_TRUE, .oldSwapchain = old };
+    VkSwapchainKHR sc = VK_NULL_HANDLE;
+    VkResult r = T.vkCreateSwapchainKHR(g_hvk.dev, &ci, NULL, &sc);
+    drop_images();
+    if (old) {
+        T.vkDestroySwapchainKHR(g_hvk.dev, old, NULL);
+    }
+    g_ps.sc = sc;
+    if (r != VK_SUCCESS) {
+        g_ps.sc = VK_NULL_HANDLE;
+        hle_log("xbased-hle-back", "present: vkCreateSwapchainKHR %ux%u: %d", w, h, r);
+        return false;
+    }
+    static VkPresentModeKHR s_told = (VkPresentModeKHR)-1;
+    if (pm != s_told) {
+        s_told = pm;
+        hle_log("xbased-hle-back", "present: V-Sync %s", pm == VK_PRESENT_MODE_FIFO_KHR ? "on" :
+                pm == VK_PRESENT_MODE_IMMEDIATE_KHR ? "off (immediate)" : "off (mailbox)");
+    }
+    uint32_t ni = 0;
+    VkResult ri = T.vkGetSwapchainImagesKHR(g_hvk.dev, sc, &ni, NULL);
+    VkImage *imgs = ri == VK_SUCCESS && ni ? g_new0(VkImage, ni) : NULL;
+    if (imgs) {
+        ri = T.vkGetSwapchainImagesKHR(g_hvk.dev, sc, &ni, imgs);
+    }
+    if (!imgs || ri != VK_SUCCESS) {
+        hle_log("xbased-hle-back", "present: the swapchain's %u images: %d", ni, ri);
+        g_free(imgs);
+        T.vkDestroySwapchainKHR(g_hvk.dev, sc, NULL);
+        g_ps.sc = VK_NULL_HANDLE;
+        return false;
+    }
+    g_ps.img = imgs;
+    g_ps.view = g_new0(VkImageView, ni);
+    g_ps.drawn = g_new0(VkSemaphore, ni);
+    for (uint32_t i = 0; i < ni; i++) {
+        VkImageViewCreateInfo vci = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_ps.img[i],
+            .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt.format,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+        T.vkCreateImageView(g_hvk.dev, &vci, NULL, &g_ps.view[i]);
+        const VkSemaphoreCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        T.vkCreateSemaphore(g_hvk.dev, &sci, NULL, &g_ps.drawn[i]);
+    }
+    g_ps.nimg = ni;
+    g_ps.ext = (VkExtent2D){ w, h };
+    g_ps.stale = false;
+    if (fmt.format != g_ps.pipe_fmt) {
+        for (unsigned i = 0; i < P_FXAA; i++) {
+            if (g_ps.pipe[i]) {
+                T.vkDestroyPipeline(g_hvk.dev, g_ps.pipe[i], NULL);
+            }
+            g_ps.pipe[i] = pipeline(g_ps.fs[i], fmt.format);
+        }
+        g_ps.pipe_fmt = fmt.format;
+    }
+    g_ps.fmt = fmt.format;
+    hle_log("xbased-hle-back", "present: swapchain %ux%u (the window %ux%u, turned %u degrees), %u images, "
+            "format %d", w, h, g_ps.wsize.width, g_ps.wsize.height, turn * 90, ni, fmt.format);
+    return g_ps.pipe[P_BILINEAR] != VK_NULL_HANDLE;
+}
+
+/* ---- each refresh ---- */
+
+static bool wait_value(uint64_t v)
+{
+    const VkResult r = hle_tl_sem_wait(g_ps.tl, v, 1000000000ull);
+    if (r == VK_ERROR_DEVICE_LOST) {
+        hle_vk_lose(r, "vkWaitSemaphores (present)");
+    }
+    return r == VK_SUCCESS;
+}
+
+/* the presenter's calls and waits (statistics) */
+static int64_t g_submit_ns, g_present_ns, g_wait_ns, g_acquire_ns;
+
+static void lose_window(void)
+{
+    g_ps.lost_ns = hle_now_ns();
+    drop_window();
+}
+
+static int g_crt;   /* the CRT filter's kind, 0 none */
+static float g_osd; /* the frame rate shown, 0 none */
+
+static float g_clip_x = 1.0f, g_clip_y = 1.0f;
+
+void hle_present_set_clip(float cx, float cy)
+{
+    g_clip_x = cx < 0.0f ? 0.0f : cx > 1.0f ? 1.0f : cx;
+    g_clip_y = cy < 0.0f ? 0.0f : cy > 1.0f ? 1.0f : cy;
+}
+
+void hle_present_set_osd(float fps)
+{
+    g_osd = fps;
+}
+
+/* V-Sync: on (FIFO, the default), or off for whoever likes tearing
+ * (IMMEDIATE, else MAILBOX, else FIFO: what the surface has). A change
+ * makes the swapchain again at the next frame. The emulated display's
+ * 60 Hz paces the frames either way (present.c). */
+static bool g_vsync = true;
+
+void hle_present_set_vsync(bool on)
+{
+    if (on != g_vsync) {
+        g_vsync = on;
+        g_ps.stale = true;
+    }
+}
+
+void hle_present_set_crt(int kind)
+{
+    g_crt = kind < 0 ? 0 : kind > 3 ? 3 : kind;
+}
+
+void hle_present_shot(const char *path)
+{
+    snprintf(g_ps.shot_path, sizeof(g_ps.shot_path), "%s", path);
+    g_ps.shot_want = true;
+}
+
+/* how the last picture ended (hle_present_shot_end): a picture that couldn't
+ * be had was asked for again each refresh, said nowhere (#383) */
+static struct {
+    char path[512], why[160];
+    int end;        /* 1 written, -1 not, 0 none since */
+} g_shot;
+
+static void shot_ended(bool ok, const char *why)
+{
+    snprintf(g_shot.path, sizeof(g_shot.path), "%s", g_ps.shot_path);
+    snprintf(g_shot.why, sizeof(g_shot.why), "%s", why ? why : "");
+    __atomic_store_n(&g_shot.end, ok ? 1 : -1, __ATOMIC_RELEASE);
+    if (!ok) {
+        hle_log("xbased-hle-back", "present: no picture in %s: %s", g_ps.shot_path, why);
+    }
+}
+
+int hle_present_shot_end(const char *path, char *why, size_t n)
+{
+    const int end = __atomic_load_n(&g_shot.end, __ATOMIC_ACQUIRE);
+    if (!end || strcmp(path, g_shot.path)) {
+        return 0;
+    }
+    if (why && n) {
+        snprintf(why, n, "%s", g_shot.why);
+    }
+    __atomic_store_n(&g_shot.end, 0, __ATOMIC_RELAXED);
+    return end;
+}
+
+/* The buffer for a picture of size bytes, host-visible. */
+static bool shot_buf(VkDeviceSize size)
+{
+    if (g_ps.shot_buf && g_ps.shot_size >= size) {
+        return true;
+    }
+    if (g_ps.shot_buf) {
+        T.vkDestroyBuffer(g_hvk.dev, g_ps.shot_buf, NULL);
+        T.vkFreeMemory(g_hvk.dev, g_ps.shot_mem, NULL);
+        g_ps.shot_buf = VK_NULL_HANDLE;
+    }
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size,
+                               .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT };
+    if (T.vkCreateBuffer(g_hvk.dev, &bci, NULL, &g_ps.shot_buf) != VK_SUCCESS) {
+        g_ps.shot_buf = VK_NULL_HANDLE;
+        return false;
+    }
+    VkMemoryRequirements mr;
+    T.vkGetBufferMemoryRequirements(g_hvk.dev, g_ps.shot_buf, &mr);
+    const int mt = hle_vk_memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt };
+    if (mt < 0 || T.vkAllocateMemory(g_hvk.dev, &mai, NULL, &g_ps.shot_mem) != VK_SUCCESS) {
+        T.vkDestroyBuffer(g_hvk.dev, g_ps.shot_buf, NULL);
+        g_ps.shot_buf = VK_NULL_HANDLE;
+        return false;
+    }
+    T.vkBindBufferMemory(g_hvk.dev, g_ps.shot_buf, g_ps.shot_mem, 0);
+    g_ps.shot_size = size;
+    return true;
+}
+
+/* The picture copied out (the pass done) as a 32-bit top-down BMP, or a
+ * JPEG (quality 90) for a path ending in .jpg. */
+static void shot_write(uint32_t w, uint32_t h)
+{
+    void *map = NULL;
+    if (T.vkMapMemory(g_hvk.dev, g_ps.shot_mem, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) {
+        shot_ended(false, "its copy couldn't be read (vkMapMemory)");
+        return;
+    }
+    const size_t pl = strlen(g_ps.shot_path);
+    if (pl > 4 && !strcasecmp(g_ps.shot_path + pl - 4, ".jpg")) {
+        const bool rgba = g_ps.fmt == VK_FORMAT_R8G8B8A8_UNORM || g_ps.fmt == VK_FORMAT_R8G8B8A8_SRGB;
+        const uint8_t *src = map;
+        uint8_t *rgb = g_malloc((size_t)w * h * 3);
+        for (size_t i = 0; i < (size_t)w * h; i++) {
+            rgb[i * 3] = src[i * 4 + (rgba ? 0 : 2)];
+            rgb[i * 3 + 1] = src[i * 4 + 1];
+            rgb[i * 3 + 2] = src[i * 4 + (rgba ? 2 : 0)];
+        }
+        errno = 0;
+        if (stbi_write_jpg(g_ps.shot_path, (int)w, (int)h, 3, rgb, 90)) {
+            hle_log("xbased-hle-back", "present: picture %ux%u in %s", w, h, g_ps.shot_path);
+            shot_ended(true, NULL);
+        } else {
+            shot_ended(false, errno ? strerror(errno) : "the file couldn't be written");
+        }
+        g_free(rgb);
+        T.vkUnmapMemory(g_hvk.dev, g_ps.shot_mem);
+        return;
+    }
+    FILE *f = fopen(g_ps.shot_path, "wb");
+    if (f) {
+        const uint32_t bytes = w * h * 4;
+        uint8_t hd[54] = { 'B', 'M' };
+        const uint32_t v[] = { 54 + bytes, 0, 54, 40, w, (uint32_t)-(int32_t)h };
+        memcpy(hd + 2, &v[0], 4);
+        memcpy(hd + 10, &v[2], 4);
+        memcpy(hd + 14, &v[3], 4);
+        memcpy(hd + 18, &v[4], 4);
+        memcpy(hd + 22, &v[5], 4);
+        hd[26] = 1;
+        hd[28] = 32;
+        fwrite(hd, 1, sizeof(hd), f);
+        const bool rgba = g_ps.fmt == VK_FORMAT_R8G8B8A8_UNORM || g_ps.fmt == VK_FORMAT_R8G8B8A8_SRGB;
+        const uint8_t *src = map;
+        uint8_t *row = g_malloc((size_t)w * 4);
+        for (uint32_t y = 0; y < h; y++) {
+            memcpy(row, src + (size_t)y * w * 4, (size_t)w * 4);
+            for (uint32_t x = 0; rgba && x < w; x++) {
+                const uint8_t t = row[x * 4];
+                row[x * 4] = row[x * 4 + 2];
+                row[x * 4 + 2] = t;
+            }
+            fwrite(row, 1, (size_t)w * 4, f);
+        }
+        g_free(row);
+        fclose(f);
+        hle_log("xbased-hle-back", "present: picture %ux%u in %s", w, h, g_ps.shot_path);
+        shot_ended(true, NULL);
+    } else {
+        shot_ended(false, strerror(errno));
+    }
+    T.vkUnmapMemory(g_hvk.dev, g_ps.shot_mem);
+}
+
+static bool ov_on(void);
+#if defined(XBEMU_HOST)
+static bool ov_changing(void);
+#endif
+/* the overlay was in the last picture: the one after it goes off isn't
+ * unchanged (a still frame, a logo, kept the menu's last fading picture on
+ * screen: Dead or Alive 3's, #193) */
+static bool g_ov_shown;
+
+bool hle_present_unchanged(struct ANativeWindow *win, uint64_t key)
+{
+    uint32_t ww = win ? (uint32_t)ANativeWindow_getWidth(win) : 0, wh = win ? (uint32_t)ANativeWindow_getHeight(win) : 0;
+    bool have_sc = g_ps.sc != VK_NULL_HANDLE;
+#ifdef _WIN32
+    if (g_rm.on) {
+        ww = g_rm.sh->cw;   /* the frame's pictures: its size */
+        wh = g_rm.sh->ch;
+        have_sc = g_rm.sh->src[g_rm.slot].vsync == (g_vsync ? 1u : 0u);
+    }
+#endif
+#if defined(XBEMU_HOST)
+    /* An overlay that is up and as it was drawn leaves the picture
+     * unchanged: the host's is a still image (its menu, its frame-rate
+     * line), set again when it changes. Taken as always changing, a present
+     * went out at every call with "Show FPS" on, each waiting a refresh in
+     * the driver with the queue's lock held: Fuzion Frenzy's Twisted System
+     * fell from 59 to 40-55 frames a second, ten of them a second late. */
+    const bool ov_new = ov_changing() || (g_ov_shown && !ov_on());
+#else
+    const bool ov_new = ov_on() || g_ov_shown;
+#endif
+    if (ov_new || g_ps.shot_want || !g_ps.shown || !win || win != g_ps.win || g_ps.stale || !have_sc ||
+        key != g_ps.shown_key || ww != g_ps.wsize.width || wh != g_ps.wsize.height ||
+        hle_disp_gamma_seq() != g_ps.ramp_gen) {
+        return false;
+    }
+    uint32_t gen, swap_id;
+    const bool front = hle_disp_front(&gen, &swap_id);
+    if (front != g_ps.have) {
+        return false;
+    }
+    return !front || (gen == g_ps.f.gen && swap_id == g_ps.f.swap_id);
+}
+
+/* ---- the frame's pictures (vk/share.h): a ring of shared images instead
+ * of a swapchain, the frame presenting them ---- */
+
+#ifdef _WIN32
+
+static bool remote_images(void)
+{
+    return g_ps.img && g_ps.img == g_rm.img;
+}
+
+int hle_present_remote_state(void)
+{
+    return g_rm.on ? 1 : g_rm.failed ? -1 : 0;
+}
+
+const char *hle_present_remote_why(void)
+{
+    static char why[sizeof(((HleShare *)0)->why)];
+    if (g_rm.sh) {
+        memcpy(why, g_rm.sh->why, sizeof(why) - 1);
+    }
+    return why;
+}
+
+void hle_present_set_remote(const char *token)
+{
+    g_rm.want = token && token[0];
+    snprintf(g_rm.token, sizeof(g_rm.token), "%s", token ? token : "");
+}
+
+bool hle_present_remote(void)
+{
+    return g_rm.on;
+}
+
+void hle_present_remote_size(uint32_t *w, uint32_t *h)
+{
+    *w = g_rm.sh ? g_rm.sh->cw : 0;
+    *h = g_rm.sh ? g_rm.sh->ch : 0;
+}
+
+void hle_present_remote_cursor(bool shown)
+{
+    if (g_rm.sh) {
+        g_rm.sh->cursor = shown ? 1 : 0;
+    }
+}
+
+void hle_present_remote_grab(bool on)
+{
+    if (g_rm.sh) {
+        g_rm.sh->grab = on ? 1 : 0;
+    }
+}
+
+/* the frame's mouse events since the last call (n at most), the next read's place in *at */
+uint32_t hle_present_remote_mouse(void *out, uint32_t n, int64_t *at)
+{
+    if (!g_rm.sh) {
+        return 0;
+    }
+    const int64_t head = g_rm.sh->mouse_head;
+    if (*at < head - HLE_SHARE_MICE) {
+        *at = head - HLE_SHARE_MICE;    /* fell behind: the newest */
+    }
+    uint32_t k = 0;
+    while (*at < head && k < n) {
+        ((HleShareMouse *)out)[k++] = g_rm.sh->mouse[*at % HLE_SHARE_MICE];
+        (*at)++;
+    }
+    return k;
+}
+
+static void remote_drop(void)
+{
+    if (g_rm.v) {
+        idle();
+    }
+    for (uint32_t i = 0; i < HLE_SHARE_IMAGES; i++) {
+        if (g_rm.view[i]) {
+            T.vkDestroyImageView(g_hvk.dev, g_rm.view[i], NULL);
+        }
+        if (g_rm.img[i]) {
+            T.vkDestroyImage(g_hvk.dev, g_rm.img[i], NULL);
+        }
+        if (g_rm.mem[i]) {
+            T.vkFreeMemory(g_hvk.dev, g_rm.mem[i], NULL);
+        }
+        g_rm.view[i] = VK_NULL_HANDLE;
+        g_rm.img[i] = VK_NULL_HANDLE;
+        g_rm.mem[i] = VK_NULL_HANDLE;
+        g_rm.val[i] = 0;
+    }
+    if (g_rm.ready) {
+        T.vkDestroySemaphore(g_hvk.dev, g_rm.ready, NULL);
+    }
+    g_rm.ready = VK_NULL_HANDLE;
+    g_rm.v = 0;
+    g_rm.on = false;
+}
+
+/* ReShade in this process (its Vulkan layer, or a DLL of its in the
+ * folder): any module that exports its add-on entry */
+static bool reshade_loaded(void)
+{
+    HMODULE mods[512];
+    DWORD bytes = 0;
+    if (!K32EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &bytes)) {
+        return false;
+    }
+    const DWORD n = bytes / sizeof(HMODULE) < 512 ? bytes / sizeof(HMODULE) : 512;
+    for (DWORD i = 0; i < n; i++) {
+        if (GetProcAddress(mods[i], "ReShadeRegisterAddon")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Whether this GPU's driver imports D3D12 images and fences (as RetroArch
+ * asks before presenting Vulkan through DXGI): said once in the log. With
+ * ReShade loaded, no: it draws on a swapchain of this process's, which the
+ * frame's pictures leave it none of (#198), so the window has its own
+ * again, as before the frame. */
+static bool remote_can(void)
+{
+    static int can = -1;
+    if (can >= 0) {
+        return can != 0;
+    }
+    if (reshade_loaded()) {
+        can = 0;
+        hle_log("xbased-hle-back", "present: ReShade is loaded: the window's own swapchain, for it to draw on");
+        return false;
+    }
+    VkPhysicalDeviceExternalSemaphoreInfo si = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
+                                                 .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT };
+    VkExternalSemaphoreProperties sp = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES };
+    vkGetPhysicalDeviceExternalSemaphoreProperties(g_hvk.phys, &si, &sp);
+    VkPhysicalDeviceExternalImageFormatInfo ei = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+                                                   .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT };
+    VkPhysicalDeviceImageFormatInfo2 fi = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2, .pNext = &ei,
+                                            .format = VK_FORMAT_B8G8R8A8_UNORM, .type = VK_IMAGE_TYPE_2D,
+                                            .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                            .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT };
+    VkExternalImageFormatProperties ep = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
+    VkImageFormatProperties2 fp = { .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, .pNext = &ep };
+    const VkResult r = vkGetPhysicalDeviceImageFormatProperties2(g_hvk.phys, &fi, &fp);
+    const bool fences = (sp.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) != 0;
+    const bool images = r == VK_SUCCESS &&
+                        (ep.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT);
+    can = g_hvk.caps.share && g_hvk.caps.luid_valid && fences && images;
+    hle_log("xbased-hle-back", "present: D3D12 pictures: images %s (%d, features %x), fences %s (features %x), LUID %s",
+            images ? "importable" : "NOT importable", (int)r, ep.externalMemoryProperties.externalMemoryFeatures,
+            fences ? "importable" : "NOT importable", sp.externalSemaphoreFeatures,
+            g_hvk.caps.luid_valid ? "valid" : "NOT valid");
+    return can != 0;
+}
+
+/* one of the frame's handles, ours */
+static HANDLE remote_handle(uint64_t theirs)
+{
+    HANDLE h = NULL;
+    if (!g_rm.frame || !DuplicateHandle(g_rm.frame, (HANDLE)(uintptr_t)theirs, GetCurrentProcess(), &h, 0, FALSE,
+                                        DUPLICATE_SAME_ACCESS)) {
+        return NULL;
+    }
+    return h;
+}
+
+static bool remote_fence(VkSemaphore *sem, uint64_t theirs)
+{
+    const VkSemaphoreCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    if (T.vkCreateSemaphore(g_hvk.dev, &sci, NULL, sem) != VK_SUCCESS) {
+        return false;
+    }
+    HANDLE h = remote_handle(theirs);
+    if (!h) {
+        return false;
+    }
+    const VkImportSemaphoreWin32HandleInfoKHR ii = {
+        .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR, .semaphore = *sem,
+        .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT, .handle = h };
+    const VkResult r = T.vkImportSemaphoreWin32HandleKHR(g_hvk.dev, &ii);
+    CloseHandle(h);     /* an NT handle's import doesn't take it */
+    if (r != VK_SUCCESS) {
+        hle_log("xbased-hle-back", "present: the frame's fence couldn't be imported (%d)", (int)r);
+    }
+    return r == VK_SUCCESS;
+}
+
+/* The frame's images for this run at w x h: asked for, made by the frame,
+ * imported. */
+static bool remote_make(uint32_t w, uint32_t h)
+{
+    remote_drop();
+    if (!g_rm.sh) {
+        wchar_t n[128];
+        swprintf(n, 128, HLE_SHARE_BLOCK_FMT, g_rm.token);
+        g_rm.map = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, n);
+        g_rm.sh = g_rm.map ? (HleShare *)MapViewOfFile(g_rm.map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(HleShare)) : NULL;
+        swprintf(n, 128, HLE_SHARE_EVENT_FMT, g_rm.token);
+        g_rm.ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, n);
+        if (!g_rm.sh || !g_rm.ev || g_rm.sh->magic != HLE_SHARE_MAGIC || g_rm.sh->version != HLE_SHARE_VERSION) {
+            hle_log("xbased-hle-back", "present: the frame's block isn't there");
+            return false;
+        }
+        g_rm.frame = OpenProcess(PROCESS_DUP_HANDLE, FALSE, g_rm.sh->frame_pid);
+        if (!g_rm.frame) {
+            hle_log("xbased-hle-back", "present: the frame's process can't be opened (%lu)", GetLastError());
+            return false;
+        }
+        /* the source not shown (an older run's, or none): the newest shows */
+        g_rm.slot = g_rm.sh->src[0].order > g_rm.sh->src[1].order ? 1 : 0;
+        g_rm.order = InterlockedIncrement64((volatile LONG64 *)&g_rm.sh->orders);
+        swprintf(n, 128, HLE_SHARE_FREED_FMT, g_rm.token, g_rm.slot);
+        g_rm.freed_ev = OpenEventW(SYNCHRONIZE, FALSE, n);
+    }
+    if (!remote_can()) {
+        return false;
+    }
+    /* the ask */
+    HleShareSrc *src = &g_rm.sh->src[g_rm.slot];
+    InterlockedExchange64((volatile LONG64 *)&src->gen, 0);
+    src->pid = GetCurrentProcessId();
+    src->w = w;
+    src->h = h;
+    src->vsync = g_vsync ? 1 : 0;
+    memcpy(src->luid, g_hvk.caps.luid, 8);
+    src->luid_valid = g_hvk.caps.luid_valid;
+    src->latest = 0;
+    src->shown = 0;
+    src->order = g_rm.order;
+    const int64_t gen = ++g_rm.gen;
+    InterlockedExchange64((volatile LONG64 *)&src->gen, gen);
+    SetEvent(g_rm.ev);
+    /* the answer: the frame makes D3D12 itself at the first (a moment) */
+    const int64_t t0 = hle_now_ns();
+    int64_t made = 0;
+    while ((made = src->made) != gen && made != -gen && !g_rm.sh->failed && hle_now_ns() - t0 < 5000000000ll) {
+        Sleep(1);
+    }
+    if (made != gen) {
+        char why[sizeof(g_rm.sh->why)];
+        memcpy(why, g_rm.sh->why, sizeof(why) - 1);
+        why[sizeof(why) - 1] = 0;
+        hle_log("xbased-hle-back", "present: the frame made no images for %ux%u (%s)", w, h,
+                made == -gen || g_rm.sh->failed ? why : "no answer in 5 s");
+        return false;
+    }
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_hvk.phys, &mp);
+    const VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
+    for (uint32_t i = 0; i < HLE_SHARE_IMAGES; i++) {
+        VkExternalMemoryImageCreateInfo xi = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+                                               .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT };
+        VkImageCreateInfo ici = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = &xi, .imageType = VK_IMAGE_TYPE_2D,
+            .format = fmt, .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+        VkResult r = T.vkCreateImage(g_hvk.dev, &ici, NULL, &g_rm.img[i]);
+        if (r != VK_SUCCESS) {
+            hle_log("xbased-hle-back", "present: no image for the frame's (%d)", (int)r);
+            return false;
+        }
+        VkMemoryRequirements mr;
+        T.vkGetImageMemoryRequirements(g_hvk.dev, g_rm.img[i], &mr);
+        HANDLE hh = remote_handle(src->res[i]);
+        if (!hh) {
+            hle_log("xbased-hle-back", "present: the frame's image handle couldn't be had (%lu)", GetLastError());
+            return false;
+        }
+        VkMemoryWin32HandlePropertiesKHR hp = { .sType = VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR };
+        r = T.vkGetMemoryWin32HandlePropertiesKHR(g_hvk.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT, hh, &hp);
+        uint32_t type = UINT32_MAX;
+        for (uint32_t t = 0; r == VK_SUCCESS && t < mp.memoryTypeCount; t++) {
+            if ((mr.memoryTypeBits & hp.memoryTypeBits & (1u << t)) &&
+                (type == UINT32_MAX || (mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))) {
+                type = t;
+                if (mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+                    break;
+                }
+            }
+        }
+        VkImportMemoryWin32HandleInfoKHR ii = { .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
+                                                .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT,
+                                                .handle = hh };
+        VkMemoryDedicatedAllocateInfo di = { .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = &ii,
+                                             .image = g_rm.img[i] };
+        VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &di,
+                                    .allocationSize = mr.size, .memoryTypeIndex = type };
+        if (type != UINT32_MAX) {
+            r = T.vkAllocateMemory(g_hvk.dev, &ai, NULL, &g_rm.mem[i]);
+        }
+        CloseHandle(hh);
+        if (type == UINT32_MAX || r != VK_SUCCESS ||
+            (r = T.vkBindImageMemory(g_hvk.dev, g_rm.img[i], g_rm.mem[i], 0)) != VK_SUCCESS) {
+            hle_log("xbased-hle-back", "present: the frame's image couldn't be imported (%d, types %x of %x)", (int)r,
+                    hp.memoryTypeBits, mr.memoryTypeBits);
+            return false;
+        }
+        VkImageViewCreateInfo vci = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_rm.img[i],
+            .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+        if (T.vkCreateImageView(g_hvk.dev, &vci, NULL, &g_rm.view[i]) != VK_SUCCESS) {
+            return false;
+        }
+    }
+    if (!remote_fence(&g_rm.ready, src->ready)) {
+        return false;
+    }
+    g_rm.w = w;
+    g_rm.h = h;
+    g_rm.next = 0;
+    g_rm.on = true;
+    /* the window's pass draws into them as into a swapchain's */
+    g_ps.ext = (VkExtent2D){ w, h };
+    g_ps.wsize = (VkExtent2D){ w, h };
+    g_ps.rot[0] = 1.0f;
+    g_ps.rot[1] = 0.0f;
+    g_ps.rot[2] = 0.0f;
+    g_ps.rot[3] = 1.0f;
+    g_ps.shot_can = true;
+    if (fmt != g_ps.pipe_fmt) {
+        for (unsigned i = 0; i < P_FXAA; i++) {
+            if (g_ps.pipe[i]) {
+                T.vkDestroyPipeline(g_hvk.dev, g_ps.pipe[i], NULL);
+            }
+            g_ps.pipe[i] = pipeline(g_ps.fs[i], fmt);
+        }
+        g_ps.pipe_fmt = fmt;
+    }
+    g_ps.fmt = fmt;
+    hle_log("xbased-hle-back", "present: %ux%u pictures for the frame (D3D12, source %d)", w, h, g_rm.slot);
+    return g_ps.pipe[P_BILINEAR] != VK_NULL_HANDLE;
+}
+
+static bool remote_begin(struct ANativeWindow *win, uint32_t *w, uint32_t *h)
+{
+    if (!g_hvk.caps.share || (g_rm.sh && g_rm.sh->failed)) {
+        remote_drop();
+        g_rm.failed = true;     /* no sharing, or the frame has no presenter: the window's own swapchain */
+        return false;
+    }
+    uint32_t cw = g_rm.sh ? g_rm.sh->cw : 0, ch = g_rm.sh ? g_rm.sh->ch : 0;
+    if (!g_rm.sh || !cw || !ch) {
+        cw = cw ? cw : 1280;
+        ch = ch ? ch : 960;
+    }
+    if (!g_rm.on || cw != g_rm.w || ch != g_rm.h ||
+        (g_rm.sh && g_rm.sh->src[g_rm.slot].vsync != (g_vsync ? 1u : 0u))) {
+        if (!remote_make(cw, ch)) {
+            remote_drop();
+            g_rm.failed = true;
+            return false;
+        }
+    }
+    if (!g_ps.sc) {
+        /* only a window's swapchain goes out of date (V-Sync turned, a
+         * present out of date): the frame's pictures follow its size and
+         * V-Sync above. Left set, nothing ever looked unchanged and the
+         * same picture went to the frame as fast as the loop ran. */
+        g_ps.stale = false;
+    }
+    g_ps.win = win;
+    PsFrame *f = &g_ps.fr[g_ps.cur];
+    const int64_t tw0 = hle_now_ns();
+    if (!wait_value(f->value)) {
+        return false;
+    }
+    /* the image free once the frame is done with what it held (copied it,
+     * or a newer one): waited here, on the CPU, as RetroArch's bridge waits
+     * its target (no GPU wait on the frame's fence: one for a value not
+     * reached yet held the queue for good) */
+    const uint32_t idx = g_rm.next % HLE_SHARE_IMAGES;
+    const volatile int64_t *freed = &g_rm.sh->src[g_rm.slot].freed;
+    for (int tries = 0; *freed < (int64_t)g_rm.val[idx] && tries < 3; tries++) {
+        if (g_rm.freed_ev) {
+            WaitForSingleObject(g_rm.freed_ev, 100);
+        } else {
+            Sleep(1);
+        }
+        if (g_rm.sh->failed) {
+            g_acquire_ns += hle_now_ns() - tw0;
+            return false;   /* the frame's gone to its word: the next begin says so */
+        }
+    }
+    g_acquire_ns += hle_now_ns() - tw0;
+    g_rm.next++;
+    g_ps.idx = idx;
+    g_ps.img = g_rm.img;    /* the pass's target (not freed by drop_images: nimg stays 0) */
+    g_ps.view = g_rm.view;
+    *w = g_rm.w;
+    *h = g_rm.h;
+    return true;
+}
+#else
+int hle_present_remote_state(void)
+{
+    return -1;
+}
+
+const char *hle_present_remote_why(void)
+{
+    return "";
+}
+
+static bool remote_images(void)
+{
+    return false;
+}
+
+void hle_present_set_remote(const char *token)
+{
+    (void)token;
+}
+
+bool hle_present_remote(void)
+{
+    return false;
+}
+
+void hle_present_remote_size(uint32_t *w, uint32_t *h)
+{
+    *w = *h = 0;
+}
+
+void hle_present_remote_cursor(bool shown)
+{
+    (void)shown;
+}
+
+void hle_present_remote_grab(bool on)
+{
+    (void)on;
+}
+
+uint32_t hle_present_remote_mouse(void *out, uint32_t n, int64_t *at)
+{
+    (void)out;
+    (void)n;
+    (void)at;
+    return 0;
+}
+#endif
+
+bool hle_present_begin(struct ANativeWindow *win, uint32_t *w, uint32_t *h)
+{
+    if (g_ps.failed || !hle_vk_ready() || hle_vk_lost()) {
+        return false;
+    }
+    if (!g_ps.inited) {
+        g_ps.inited = true;
+        if (!g_hvk.caps.swapchain || !init()) {
+            g_ps.failed = true;
+            hle_log("xbased-hle-back", "present: %s: nothing shown",
+                    g_hvk.caps.swapchain ? "setup failed" : "no Vulkan swapchain on this device");
+            return false;
+        }
+    }
+#ifdef _WIN32
+    if (g_rm.want && !g_rm.failed) {
+        if (remote_begin(win, w, h)) {
+            return true;
+        }
+        if (!g_rm.failed) {
+            return false;   /* not this refresh */
+        }
+        hle_log("xbased-hle-back", "present: the frame's pictures failed: the window's own swapchain");
+    }
+#endif
+    /* a lost surface's window may come back at the same address: a while
+     * later, whatever window there is gets a new one */
+    if (win != g_ps.win && (!win || hle_now_ns() - g_ps.lost_ns > 250000000ll)) {
+        drop_window();
+        if (win) {
+#if defined(XBEMU_HOST) && defined(NC_DESKTOP) && !defined(_WIN32)
+            if (!hle_host_surface_create((void *)g_hvk.inst, (void *)&g_ps.surf)) {   /* xbemu: the host's */
+#elif defined(NC_DESKTOP) && !defined(_WIN32)
+            if (!SDL_Vulkan_CreateSurface((SDL_Window *)win->sdl_window, g_hvk.inst, NULL, &g_ps.surf)) {
+#elif defined(_WIN32)
+            VkWin32SurfaceCreateInfoKHR sci = { .sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
+                                                .hinstance = (HINSTANCE)win->hinstance, .hwnd = (HWND)win->hwnd };
+            if (vkCreateWin32SurfaceKHR(g_hvk.inst, &sci, NULL, &g_ps.surf) != VK_SUCCESS) {
+#else
+            VkAndroidSurfaceCreateInfoKHR sci = { .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
+                                                  .window = win };
+            if (vkCreateAndroidSurfaceKHR(g_hvk.inst, &sci, NULL, &g_ps.surf) != VK_SUCCESS) {
+#endif
+                g_ps.surf = VK_NULL_HANDLE;
+                g_ps.lost_ns = hle_now_ns();
+                hle_log("xbased-hle-back", "present: no surface for the window");
+            } else {
+                g_ps.win = win;
+            }
+        }
+    }
+    if (!g_ps.surf) {
+        return false;
+    }
+    const uint32_t ww = (uint32_t)ANativeWindow_getWidth(win), wh = (uint32_t)ANativeWindow_getHeight(win);
+    if ((!g_ps.sc || g_ps.stale || ww != g_ps.wsize.width || wh != g_ps.wsize.height) && !make_swapchain(ww, wh)) {
+        return false;
+    }
+    PsFrame *f = &g_ps.fr[g_ps.cur];
+    const int64_t tw0 = hle_now_ns();
+    if (!wait_value(f->value)) {
+        return false;
+    }
+    const int64_t ta0 = hle_now_ns();
+    g_wait_ns += ta0 - tw0;
+    VkResult r = T.vkAcquireNextImageKHR(g_hvk.dev, g_ps.sc, 100000000ull, f->acquired, VK_NULL_HANDLE,
+                                         &g_ps.idx);
+    g_acquire_ns += hle_now_ns() - ta0;
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+        g_ps.stale = true;
+        return false;
+    }
+    if (r == VK_ERROR_SURFACE_LOST_KHR) {
+        lose_window();
+        return false;
+    }
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+        if (r != VK_TIMEOUT && r != VK_NOT_READY) {
+            hle_vk_check(r, "vkAcquireNextImageKHR");
+        }
+        return false;                   /* timed out: the next refresh tries again */
+    }
+    if (g_ps.idx >= g_ps.nimg) {
+        hle_log("xbased-hle-back", "present: acquired image %u of %u", g_ps.idx, g_ps.nimg);
+        g_ps.stale = true;
+        return false;
+    }
+    if (r == VK_SUBOPTIMAL_KHR && g_ps.follows) {
+        g_ps.stale = true;              /* the panel turned: this image, then another swapchain */
+    }
+    *w = g_ps.wsize.width;
+    *h = g_ps.wsize.height;
+    return true;
+}
+
+bool hle_present_frame(uint32_t *w, uint32_t *h)
+{
+    hle_disp_use_begin();               /* the slots' images stay until the submit */
+    g_ps.using = true;
+    if (g_ps.have && g_ps.f.gen != hle_disp_gen()) {
+        g_ps.have = false;              /* the display was made again: its image is gone */
+    }
+    HleDispFrame f;
+    if (hle_disp_acquire(&f) && (!g_ps.have || f.slot != g_ps.f.slot)) {
+        /* a new frame: the one shown goes back (its reads are submitted, and
+         * the render thread's next write of it comes after them) */
+        if (g_ps.have) {
+            hle_disp_release(g_ps.f.slot);
+        }
+        g_ps.f = f;
+        g_ps.have = true;
+        g_ps.serial++;
+    }
+    if (g_ps.have) {
+        *w = g_ps.f.w;
+        *h = g_ps.f.h;
+    }
+    return g_ps.have;
+}
+
+/* Image t at w x h (FXAA's at the frame's size, FSR's at the frame's in the
+ * window), made again when that changes; false when it can't be. */
+static bool img_target(PsImg *t, uint32_t w, uint32_t h, VkFormat fmt, const char *what)
+{
+    if (t->img && t->w == w && t->h == h && t->fmt == fmt) {
+        return true;
+    }
+    if (t->img) {
+        wait_value(g_ps.submitted);
+        T.vkDestroyImageView(g_hvk.dev, t->view, NULL);
+        T.vkDestroyImage(g_hvk.dev, t->img, NULL);
+        T.vkFreeMemory(g_hvk.dev, t->mem, NULL);
+        t->img = VK_NULL_HANDLE;
+    }
+    VkImageCreateInfo ici = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+        .format = fmt, .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    if (T.vkCreateImage(g_hvk.dev, &ici, NULL, &t->img) != VK_SUCCESS) {
+        t->img = VK_NULL_HANDLE;
+        return false;
+    }
+    VkMemoryRequirements mr;
+    T.vkGetImageMemoryRequirements(g_hvk.dev, t->img, &mr);
+    int mt = hle_vk_memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt };
+    VkImageViewCreateInfo vci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t->img,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    if (mt < 0 || T.vkAllocateMemory(g_hvk.dev, &mai, NULL, &t->mem) != VK_SUCCESS ||
+        T.vkBindImageMemory(g_hvk.dev, t->img, t->mem, 0) != VK_SUCCESS ||
+        T.vkCreateImageView(g_hvk.dev, &vci, NULL, &t->view) != VK_SUCCESS) {
+        hle_log("xbased-hle-back", "present: no %ux%u %s image: %s off", w, h, what, what);
+        T.vkDestroyImage(g_hvk.dev, t->img, NULL);
+        t->img = VK_NULL_HANDLE;
+        return false;
+    }
+    t->w = w;
+    t->h = h;
+    t->fmt = fmt;
+    t->serial = 0;
+    return true;
+}
+
+static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to,
+                    VkPipelineStageFlags2 src, VkAccessFlags2 src_access, VkPipelineStageFlags2 dst,
+                    VkAccessFlags2 dst_access)
+{
+    VkImageMemoryBarrier2 b = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = src,
+        .srcAccessMask = src_access, .dstStageMask = dst, .dstAccessMask = dst_access,
+        .oldLayout = from, .newLayout = to,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    VkDependencyInfo di = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
+                            .pImageMemoryBarriers = &b };
+    T.vkCmdPipelineBarrier2(cb, &di);
+}
+
+/* the sampler set_src gives: the picture's pass upscaling as nearest
+ * neighbour (#183, the pixels kept square and sharp), else linear */
+static bool g_smp_near;
+
+/* Set ds to sample src (and the frame's share of the ramp). */
+static void set_src(PsFrame *f, VkDescriptorSet ds, VkImageView src)
+{
+    VkDescriptorImageInfo ii = { g_smp_near ? g_ps.smp_near : g_ps.smp, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkDescriptorBufferInfo bi = { g_ps.ubo, (VkDeviceSize)(f - g_ps.fr) * PS_RAMP, 768 };
+    VkWriteDescriptorSet wr[2] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0,
+          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 1,
+          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi } };
+    T.vkUpdateDescriptorSets(g_hvk.dev, 2, wr, 0, NULL);
+}
+
+/* A quad of pipeline p over rect (clip space) into the rendering open. */
+static void quad_ds(VkCommandBuffer cb, PsFrame *f, VkDescriptorSet ds, VkPipeline p, VkImageView src,
+                    const float pc[12], uint32_t w, uint32_t h)
+{
+    set_src(f, ds, src);
+    VkViewport vp = { 0, 0, (float)w, (float)h, 0.0f, 1.0f };
+    VkRect2D sc = { { 0, 0 }, { w, h } };
+    T.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    T.vkCmdSetViewport(cb, 0, 1, &vp);
+    T.vkCmdSetScissor(cb, 0, 1, &sc);
+    T.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ps.pl, 0, 1, &ds, 0, NULL);
+    T.vkCmdPushConstants(cb, g_ps.pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48, pc);
+    T.vkCmdDraw(cb, 4, 1, 0, 0);
+}
+
+static void quad(VkCommandBuffer cb, PsFrame *f, unsigned set, VkPipeline p, VkImageView src,
+                 const float pc[12], uint32_t w, uint32_t h)
+{
+    quad_ds(cb, f, f->set[set], p, src, pc, w, h);
+}
+
+/* The picture's quad, cut to the clip rectangle (hle_present_set_clip):
+ * the window's axes, swapped for a display turned a quarter */
+static void quad_clipped(VkCommandBuffer cb, PsFrame *f, unsigned set, VkPipeline p, VkImageView src,
+                         const float pc[12], uint32_t w, uint32_t h)
+{
+    if (g_clip_x >= 1.0f && g_clip_y >= 1.0f) {
+        quad(cb, f, set, p, src, pc, w, h);
+        return;
+    }
+    const bool turned = fabsf(g_ps.rot[0]) < 0.5f;
+    const float cx = turned ? g_clip_y : g_clip_x, cy = turned ? g_clip_x : g_clip_y;
+    set_src(f, f->set[set], src);
+    VkViewport vp = { 0, 0, (float)w, (float)h, 0.0f, 1.0f };
+    const uint32_t sw = (uint32_t)(cx * (float)w + 0.5f), sh = (uint32_t)(cy * (float)h + 0.5f);
+    VkRect2D sc = { { (int32_t)((w - sw) / 2), (int32_t)((h - sh) / 2) }, { sw, sh } };
+    T.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    T.vkCmdSetViewport(cb, 0, 1, &vp);
+    T.vkCmdSetScissor(cb, 0, 1, &sc);
+    T.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ps.pl, 0, 1, &f->set[set], 0, NULL);
+    T.vkCmdPushConstants(cb, g_ps.pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48, pc);
+    T.vkCmdDraw(cb, 4, 1, 0, 0);
+}
+
+static void rendering(VkCommandBuffer cb, VkImageView v, uint32_t w, uint32_t h, bool clear)
+{
+    VkRenderingAttachmentInfo ca = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v,
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue = { .color = { { 0, 0, 0, 1 } } } };
+    VkRenderingInfo ri = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { w, h } },
+                           .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &ca };
+    T.vkCmdBeginRendering(cb, &ri);
+}
+
+/* A pass of pipeline p over all of image t from src (extra: the shader's
+ * pc.extra); t is sampled after it. */
+static void img_pass_ds(VkCommandBuffer cb, PsFrame *f, VkDescriptorSet ds, PsImg *t, VkPipeline p,
+                        VkImageView src, const float extra[4])
+{
+    barrier(cb, t->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    rendering(cb, t->view, t->w, t->h, false);
+    float pc[12] = { -1.0f, -1.0f, 1.0f, 1.0f, 0, 0, 0, 0, 1.0f, 0, 0, 1.0f };
+    memcpy(pc + 4, extra, 4 * sizeof(float));
+    quad_ds(cb, f, ds, p, src, pc, t->w, t->h);
+    T.vkCmdEndRendering(cb);
+    barrier(cb, t->img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+}
+
+static void img_pass(VkCommandBuffer cb, PsFrame *f, unsigned set, PsImg *t, VkPipeline p, VkImageView src,
+                     const float extra[4])
+{
+    img_pass_ds(cb, f, f->set[set], t, p, src, extra);
+}
+
+/* How the frame meets the window, logged when that changes. */
+static void log_path(unsigned p, bool fxaa, uint32_t vw, uint32_t vh)
+{
+    static unsigned s_p = ~0u;
+    static bool s_fxaa;
+    static uint32_t s_w, s_h, s_vw, s_vh;
+    if (p == s_p && fxaa == s_fxaa && g_ps.f.w == s_w && g_ps.f.h == s_h && vw == s_vw && vh == s_vh) {
+        return;
+    }
+    s_p = p;
+    s_fxaa = fxaa;
+    s_w = g_ps.f.w;
+    s_h = g_ps.f.h;
+    s_vw = vw;
+    s_vh = vh;
+    hle_log("xbased-hle-back", "present: %ux%u%s into %ux%u: %s", s_w, s_h, fxaa ? " after FXAA" : "", vw, vh,
+            p == P_AREA ? "averaged down" : p == P_RCAS ? "scaled up by FSR" : "bilinear");
+}
+
+/* ---- the overlay (swapchain.h) ----
+ *
+ * The front end's interface as triangles over the picture, in the window
+ * pass itself: textures of its own (uploaded with the refresh that first
+ * draws them), and while it covers the window the picture as a texture too,
+ * drawn into an image of the window's size as the window would show it,
+ * and that blurred (the dual filter's chain, k_fs_kdown/k_fs_kup), both
+ * made again only when the picture or its place changes: under the in-game
+ * menu the game is paused and they are made once. With no overlay set none
+ * of this runs. */
+
+#define OV_TEX_MAX 256
+#define OV_BLUR 5               /* the blur's chain: a half .. a 32nd */
+
+typedef struct OvTex {
+    VkImage img;
+    VkDeviceMemory mem;
+    VkImageView view;
+    VkDescriptorSet set;
+    uint32_t w, h;
+    uint8_t state;              /* 0 free, 1 asked for, 2 made, 3 freed: gone once dead_at is done */
+    bool fresh;                 /* just made: cleared before anything is written */
+    uint64_t dead_at;
+} OvTex;
+
+typedef struct OvPut {
+    uint32_t id, x, y, w, h;
+    uint8_t *px;                /* w * h * 4, packed */
+} OvPut;
+
+static struct {
+    OvTex tex[OV_TEX_MAX];      /* 0: white, 1x1 */
+    OvPut *put;
+    uint32_t nput, cput;
+    HleOvVert *v;
+    HleOvCmd *c;
+    uint32_t nv, cv, nc, cc, flags;
+    bool on, scene, blur;       /* set; its commands sample the picture, its blur */
+    bool inited, ok;
+    bool dirty;                 /* textures to make, write or let go */
+    VkDescriptorPool dp;
+    VkShaderModule vs, fs;
+    VkPipeline pipe[3];
+    VkFormat pipe_fmt;
+    PsImg comp, chain[OV_BLUR];
+    uint64_t comp_key, blur_key;
+    uint64_t presented;
+} g_ov;
+
+static bool ov_on(void)
+{
+    return g_ov.on;
+}
+
+#if defined(XBEMU_HOST)
+/* The overlay's picture is not the one last drawn: a texture of it was
+ * written or freed since, or it shows the scene behind it (which moves). */
+static bool ov_changing(void)
+{
+    return g_ov.on && (g_ov.dirty || g_ov.scene || g_ov.blur);
+}
+#endif
+
+uint64_t hle_present_count(void)
+{
+    return g_ov.presented;
+}
+
+uint32_t hle_ov_tex_new(uint32_t w, uint32_t h)
+{
+    if (!w || !h || w > 8192 || h > 8192) {
+        return 0;
+    }
+    for (uint32_t i = 1; i < OV_TEX_MAX; i++) {
+        OvTex *t = &g_ov.tex[i];
+        if (t->state == 0) {
+            memset(t, 0, sizeof(*t));
+            t->w = w;
+            t->h = h;
+            t->state = 1;
+            g_ov.dirty = true;
+            return i;
+        }
+    }
+    hle_log("xbased-hle-back", "present: overlay textures all taken");
+    return 0;
+}
+
+void hle_ov_tex_put(uint32_t id, uint32_t x, uint32_t y, uint32_t w, uint32_t h, const void *rgba, uint32_t stride)
+{
+    if (id >= OV_TEX_MAX || (g_ov.tex[id].state != 1 && g_ov.tex[id].state != 2) || !w || !h || !rgba ||
+        x + w > g_ov.tex[id].w || y + h > g_ov.tex[id].h) {
+        return;
+    }
+    if (g_ov.nput == g_ov.cput) {
+        g_ov.cput = g_ov.cput ? g_ov.cput * 2 : 64;
+        g_ov.put = g_renew(OvPut, g_ov.put, g_ov.cput);
+    }
+    OvPut *p = &g_ov.put[g_ov.nput++];
+    g_ov.dirty = true;
+    p->id = id;
+    p->x = x;
+    p->y = y;
+    p->w = w;
+    p->h = h;
+    p->px = g_malloc((size_t)w * h * 4);
+    for (uint32_t r = 0; r < h; r++) {
+        memcpy(p->px + (size_t)r * w * 4, (const uint8_t *)rgba + (size_t)r * stride, (size_t)w * 4);
+    }
+}
+
+void hle_ov_tex_free(uint32_t id)
+{
+    if (id == 0 || id >= OV_TEX_MAX) {
+        return;
+    }
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < g_ov.nput; i++) {   /* its uploads go; the others keep their order */
+        if (g_ov.put[i].id == id) {
+            g_free(g_ov.put[i].px);
+        } else {
+            g_ov.put[k++] = g_ov.put[i];
+        }
+    }
+    g_ov.nput = k;
+    OvTex *t = &g_ov.tex[id];
+    if (t->state == 1) {
+        t->state = 0;
+    } else if (t->state == 2) {
+        t->state = 3;
+        t->dead_at = g_ps.submitted;    /* the last submit that may sample it */
+        g_ov.dirty = true;
+    }
+}
+
+void hle_present_set_overlay(const HleOvVert *v, uint32_t nv, const HleOvCmd *c, uint32_t nc, uint32_t flags)
+{
+    g_ps.shown = false;                 /* drawn again, with or without */
+    if (!v || !c || !nv || !nc) {
+        g_ov.on = false;
+        g_ov.nv = g_ov.nc = 0;
+        return;
+    }
+    if (nv > g_ov.cv) {
+        g_ov.cv = nv + nv / 2;
+        g_ov.v = g_renew(HleOvVert, g_ov.v, g_ov.cv);
+    }
+    if (nc > g_ov.cc) {
+        g_ov.cc = nc + nc / 2;
+        g_ov.c = g_renew(HleOvCmd, g_ov.c, g_ov.cc);
+    }
+    memcpy(g_ov.v, v, nv * sizeof(*v));
+    memcpy(g_ov.c, c, nc * sizeof(*c));
+    g_ov.nv = nv;
+    g_ov.nc = nc;
+    g_ov.flags = flags;
+    g_ov.scene = g_ov.blur = false;
+    for (uint32_t i = 0; i < nc; i++) {
+        g_ov.scene |= c[i].tex == HLE_OV_SCENE;
+        g_ov.blur |= c[i].tex == HLE_OV_SCENE_BLUR;
+    }
+    g_ov.on = true;
+}
+
+static VkPipeline ov_pipeline(VkFormat fmt, uint32_t blend)
+{
+    VkPipelineShaderStageCreateInfo st[2] = {
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = g_ov.vs, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = g_ov.fs, .pName = "main" } };
+    VkVertexInputBindingDescription vb = { 0, sizeof(HleOvVert), VK_VERTEX_INPUT_RATE_VERTEX };
+    VkVertexInputAttributeDescription va[3] = {
+        { 0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(HleOvVert, x) },
+        { 1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(HleOvVert, u) },
+        { 2, 0, VK_FORMAT_R8G8B8A8_UNORM, offsetof(HleOvVert, rgba) } };
+    VkPipelineVertexInputStateCreateInfo vi = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, .vertexBindingDescriptionCount = 1,
+        .pVertexBindingDescriptions = &vb, .vertexAttributeDescriptionCount = 3, .pVertexAttributeDescriptions = va };
+    VkPipelineInputAssemblyStateCreateInfo ia = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+    VkPipelineViewportStateCreateInfo vp = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
+    VkPipelineRasterizationStateCreateInfo rs = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1.0f };
+    VkPipelineMultisampleStateCreateInfo ms = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+    /* straight alpha (SDL's BLEND), added light (ADD), premultiplied */
+    VkPipelineColorBlendAttachmentState ba = {
+        .blendEnable = VK_TRUE, .colorBlendOp = VK_BLEND_OP_ADD, .alphaBlendOp = VK_BLEND_OP_ADD,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorWriteMask = 0xF };
+    if (blend == HLE_OV_ADD) {
+        ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    } else if (blend == HLE_OV_PREMUL) {
+        ba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    }
+    VkPipelineColorBlendStateCreateInfo cb = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &ba };
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo ds = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn };
+    VkPipelineRenderingCreateInfo rci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1,
+        .pColorAttachmentFormats = &fmt };
+    VkGraphicsPipelineCreateInfo gci = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &rci, .stageCount = 2, .pStages = st,
+        .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs,
+        .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &ds, .layout = g_ps.pl };
+    VkPipeline p = VK_NULL_HANDLE;
+    if (T.vkCreateGraphicsPipelines(g_hvk.dev, VK_NULL_HANDLE, 1, &gci, NULL, &p) != VK_SUCCESS) {
+        p = VK_NULL_HANDLE;
+    }
+    return p;
+}
+
+/* Its descriptor pool (the textures', each frame's), shaders, and white. */
+static bool ov_init(void)
+{
+    if (g_ov.inited) {
+        return g_ov.ok;
+    }
+    g_ov.inited = true;
+    const uint32_t sets = OV_TEX_MAX + PS_FRAMES * 12;
+    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sets },
+                                   { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, sets } };
+    VkDescriptorPoolCreateInfo pci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, .maxSets = sets,
+        .poolSizeCount = 2, .pPoolSizes = ps };
+    if (T.vkCreateDescriptorPool(g_hvk.dev, &pci, NULL, &g_ov.dp) != VK_SUCCESS) {
+        hle_log("xbased-hle-back", "present: no overlay (descriptor pool)");
+        return false;
+    }
+    for (unsigned i = 0; i < PS_FRAMES; i++) {
+        VkDescriptorSetLayout l[12];
+        for (unsigned k = 0; k < 12; k++) {
+            l[k] = g_ps.dsl;
+        }
+        VkDescriptorSet s[12];
+        VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                            .descriptorPool = g_ov.dp, .descriptorSetCount = 12, .pSetLayouts = l };
+        if (T.vkAllocateDescriptorSets(g_hvk.dev, &dai, s) != VK_SUCCESS) {
+            hle_log("xbased-hle-back", "present: no overlay (descriptor sets)");
+            return false;
+        }
+        g_ps.fr[i].ovs[0] = s[0];
+        g_ps.fr[i].ovs[1] = s[1];
+        memcpy(g_ps.fr[i].bset, s + 2, sizeof(g_ps.fr[i].bset));
+    }
+    g_ov.vs = module(HLE_SHADER_VERTEX, "", k_vs_ov);
+    g_ov.fs = module(HLE_SHADER_FRAGMENT, "", k_fs_ov);
+    if (!g_ov.vs || !g_ov.fs || !g_ps.pipe[P_KDOWN] || !g_ps.pipe[P_KUP]) {
+        hle_log("xbased-hle-back", "present: no overlay (shaders)");
+        return false;
+    }
+    g_ov.tex[0] = (OvTex){ .w = 1, .h = 1, .state = 1 };
+    static const uint32_t white = 0xFFFFFFFFu;
+    hle_ov_tex_put(0, 0, 0, 1, 1, &white, 4);
+    g_ov.ok = true;
+    hle_log("xbased-hle-back", "present: overlay ready");
+    return true;
+}
+
+bool hle_ov_ready(void)
+{
+    /* a window of its own (its swapchain), or the frame's pictures: the
+     * overlay draws over either. Asked for the swapchain only, the in-game
+     * menu took the way without the overlay under the frame and left its
+     * last fading picture up when it closed (#193) */
+#ifdef _WIN32
+    const bool target = g_ps.sc || g_rm.on;
+#else
+    const bool target = g_ps.sc != VK_NULL_HANDLE;
+#endif
+    return g_ps.inited && !g_ps.failed && target && ov_init();
+}
+
+/* A host-visible buffer of at least need bytes, mapped (a frame's own: its
+ * last submit is done when the frame comes round again). */
+static bool host_buf(VkBuffer *b, VkDeviceMemory *m, uint8_t **map, VkDeviceSize *have, VkDeviceSize need,
+                     VkBufferUsageFlags use)
+{
+    if (*b && *have >= need) {
+        return true;
+    }
+    if (*b) {
+        T.vkDestroyBuffer(g_hvk.dev, *b, NULL);
+        T.vkFreeMemory(g_hvk.dev, *m, NULL);
+        *b = VK_NULL_HANDLE;
+        *map = NULL;
+        *have = 0;
+    }
+    need = MAX(need + need / 2, (VkDeviceSize)65536);
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = need, .usage = use };
+    if (T.vkCreateBuffer(g_hvk.dev, &bci, NULL, b) != VK_SUCCESS) {
+        *b = VK_NULL_HANDLE;
+        return false;
+    }
+    VkMemoryRequirements mr;
+    T.vkGetBufferMemoryRequirements(g_hvk.dev, *b, &mr);
+    const int mt = hle_vk_memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt };
+    if (mt < 0 || T.vkAllocateMemory(g_hvk.dev, &mai, NULL, m) != VK_SUCCESS) {
+        T.vkDestroyBuffer(g_hvk.dev, *b, NULL);
+        *b = VK_NULL_HANDLE;
+        return false;
+    }
+    if (T.vkBindBufferMemory(g_hvk.dev, *b, *m, 0) != VK_SUCCESS ||
+        T.vkMapMemory(g_hvk.dev, *m, 0, VK_WHOLE_SIZE, 0, (void **)map) != VK_SUCCESS) {
+        T.vkDestroyBuffer(g_hvk.dev, *b, NULL);
+        T.vkFreeMemory(g_hvk.dev, *m, NULL);
+        *b = VK_NULL_HANDLE;
+        return false;
+    }
+    *have = need;
+    return true;
+}
+
+static bool ov_make(OvTex *t)
+{
+    VkImageCreateInfo ici = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = { t->w, t->h, 1 }, .mipLevels = 1, .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    if (T.vkCreateImage(g_hvk.dev, &ici, NULL, &t->img) != VK_SUCCESS) {
+        t->img = VK_NULL_HANDLE;
+        return false;
+    }
+    VkMemoryRequirements mr;
+    T.vkGetImageMemoryRequirements(g_hvk.dev, t->img, &mr);
+    const int mt = hle_vk_memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt };
+    VkImageViewCreateInfo vci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t->img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                        .descriptorPool = g_ov.dp, .descriptorSetCount = 1,
+                                        .pSetLayouts = &g_ps.dsl };
+    if (mt < 0 || T.vkAllocateMemory(g_hvk.dev, &mai, NULL, &t->mem) != VK_SUCCESS) {
+        T.vkDestroyImage(g_hvk.dev, t->img, NULL);
+        t->img = VK_NULL_HANDLE;
+        return false;
+    }
+    if (T.vkBindImageMemory(g_hvk.dev, t->img, t->mem, 0) != VK_SUCCESS ||
+        T.vkCreateImageView(g_hvk.dev, &vci, NULL, &t->view) != VK_SUCCESS ||
+        T.vkAllocateDescriptorSets(g_hvk.dev, &dai, &t->set) != VK_SUCCESS) {
+        T.vkDestroyImage(g_hvk.dev, t->img, NULL);
+        T.vkFreeMemory(g_hvk.dev, t->mem, NULL);
+        t->img = VK_NULL_HANDLE;
+        return false;
+    }
+    set_src(&g_ps.fr[0], t->set, t->view);
+    t->fresh = true;
+    return true;
+}
+
+static void ov_destroy(OvTex *t)
+{
+    if (t->img) {
+        T.vkFreeDescriptorSets(g_hvk.dev, g_ov.dp, 1, &t->set);
+        T.vkDestroyImageView(g_hvk.dev, t->view, NULL);
+        T.vkDestroyImage(g_hvk.dev, t->img, NULL);
+        T.vkFreeMemory(g_hvk.dev, t->mem, NULL);
+    }
+    memset(t, 0, sizeof(*t));
+}
+
+static bool rects_meet(const OvPut *a, const OvPut *b)
+{
+    return a->x < b->x + b->w && b->x < a->x + a->w && a->y < b->y + b->h && b->y < a->y + a->h;
+}
+
+/* Textures gone, made, cleared and written, before the passes (with no
+ * overlay up too: what one left goes). */
+static void ov_textures(VkCommandBuffer cb, PsFrame *f)
+{
+    g_ov.dirty = false;
+    for (uint32_t i = 1; i < OV_TEX_MAX; i++) {
+        OvTex *t = &g_ov.tex[i];
+        if (t->state == 3) {
+            if (hle_tl_sem_wait(g_ps.tl, t->dead_at, 0) == VK_SUCCESS) {
+                ov_destroy(t);
+            } else {
+                g_ov.dirty = true;      /* still sampled: a later refresh */
+            }
+        }
+    }
+    bool any = false;
+    for (uint32_t i = 0; i < OV_TEX_MAX; i++) {
+        OvTex *t = &g_ov.tex[i];
+        if (t->state == 1) {
+            if (!ov_make(t)) {
+                hle_log("xbased-hle-back", "present: no %ux%u overlay texture", t->w, t->h);
+            }
+            t->state = 2;               /* drawn as nothing if it failed */
+        }
+        any |= t->fresh;
+    }
+    VkDeviceSize bytes = 0;
+    for (uint32_t i = 0; i < g_ov.nput; i++) {
+        bytes += (VkDeviceSize)g_ov.put[i].w * g_ov.put[i].h * 4;
+    }
+    if (!any && !bytes) {
+        return;
+    }
+    if (bytes && !host_buf(&f->stage, &f->stage_mem, &f->stage_map, &f->stage_size, bytes,
+                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) {
+        bytes = 0;                      /* nothing written this refresh: tried again next */
+    }
+    bool touched[OV_TEX_MAX] = { false };
+    for (uint32_t i = 0; i < OV_TEX_MAX; i++) {
+        OvTex *t = &g_ov.tex[i];
+        if (t->img && t->fresh) {
+            barrier(cb, t->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                    VK_ACCESS_2_TRANSFER_WRITE_BIT);
+            static const VkClearColorValue clear = { { 0, 0, 0, 0 } };
+            const VkImageSubresourceRange rr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            T.vkCmdClearColorImage(cb, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &rr);
+            touched[i] = true;
+        }
+    }
+    if (bytes) {
+        for (uint32_t i = 0; i < g_ov.nput; i++) {
+            OvTex *t = &g_ov.tex[g_ov.put[i].id];
+            if (t->img && !touched[g_ov.put[i].id]) {
+                barrier(cb, t->img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                        VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                touched[g_ov.put[i].id] = true;
+            }
+        }
+        /* after the clears; and a write over an earlier one of this batch after it */
+        VkMemoryBarrier2 mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                .dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT };
+        VkDependencyInfo di = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                .pMemoryBarriers = &mb };
+        if (any) {
+            T.vkCmdPipelineBarrier2(cb, &di);
+        }
+        VkDeviceSize off = 0;
+        for (uint32_t i = 0; i < g_ov.nput; i++) {
+            const OvPut *p = &g_ov.put[i];
+            const VkDeviceSize n = (VkDeviceSize)p->w * p->h * 4;
+            memcpy(f->stage_map + off, p->px, (size_t)n);
+            OvTex *t = &g_ov.tex[p->id];
+            if (t->img) {
+                for (uint32_t j = 0; j < i; j++) {
+                    if (g_ov.put[j].id == p->id && rects_meet(&g_ov.put[j], p)) {
+                        T.vkCmdPipelineBarrier2(cb, &di);
+                        break;
+                    }
+                }
+                VkBufferImageCopy r = { .bufferOffset = off,
+                                        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                        .imageOffset = { (int32_t)p->x, (int32_t)p->y, 0 },
+                                        .imageExtent = { p->w, p->h, 1 } };
+                T.vkCmdCopyBufferToImage(cb, f->stage, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+            }
+            off += n;
+        }
+        for (uint32_t i = 0; i < g_ov.nput; i++) {
+            g_free(g_ov.put[i].px);
+        }
+        g_ov.nput = 0;
+    }
+    for (uint32_t i = 0; i < OV_TEX_MAX; i++) {
+        if (touched[i]) {
+            barrier(cb, g_ov.tex[i].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            g_ov.tex[i].fresh = false;
+        }
+    }
+}
+
+static uint64_t mix64(uint64_t h, uint64_t v)
+{
+    return (h ^ v) * 0x100000001B3ull;
+}
+
+/* The picture into comp as the window would show it (p over rect from
+ * `from`), and its blur, each when what it shows changed. */
+static void ov_scene(VkCommandBuffer cb, PsFrame *f, unsigned p, const float pc_in[12], VkImageView from,
+                     uint64_t key)
+{
+    const uint32_t ww = g_ps.wsize.width, wh = g_ps.wsize.height;
+    uint64_t k = 0xCBF29CE484222325ull;
+    k = mix64(k, g_ps.have ? g_ps.serial : 0);
+    k = mix64(k, key);
+    k = mix64(k, (uint64_t)ww << 32 | wh);
+    k = mix64(k, g_ps.ramp_gen);
+    k = mix64(k, (uint64_t)g_crt << 32 | (uint64_t)g_ps.fmt);
+    uint32_t sxy[2];
+    memcpy(&sxy[0], &pc_in[2], 4);
+    memcpy(&sxy[1], &pc_in[3], 4);
+    k = mix64(k, (uint64_t)sxy[0] << 32 | sxy[1]);
+    if (!img_target(&g_ov.comp, ww, wh, g_ps.fmt, "overlay")) {
+        return;
+    }
+    if (k != g_ov.comp_key || !g_ov.comp.serial) {
+        barrier(cb, g_ov.comp.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        rendering(cb, g_ov.comp.view, ww, wh, true);
+        if (g_ps.have && g_ps.pipe[p]) {
+            float pc[12];
+            memcpy(pc, pc_in, sizeof(pc));
+            pc[8] = 1.0f;               /* the window's orientation: the overlay turns it */
+            pc[9] = pc[10] = 0.0f;
+            pc[11] = 1.0f;
+            quad(cb, f, SET_WINDOW, g_ps.pipe[p], from, pc, ww, wh);   /* the window pass isn't drawn under a cover */
+        }
+        T.vkCmdEndRendering(cb);
+        barrier(cb, g_ov.comp.img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        g_ov.comp_key = k;
+        g_ov.comp.serial = 1;           /* it holds a picture (made again: 0) */
+    }
+    set_src(f, f->ovs[0], g_ov.comp.view);
+    if (!g_ov.blur) {
+        return;
+    }
+    bool chain = true;
+    for (unsigned i = 0; i < OV_BLUR && chain; i++) {
+        chain = img_target(&g_ov.chain[i], MAX(ww >> (i + 1), 1u), MAX(wh >> (i + 1), 1u), g_ps.fmt, "blur");
+        chain = chain && g_ov.chain[i].serial;
+    }
+    if (k != g_ov.blur_key || !chain) {
+        for (unsigned i = 0; i < OV_BLUR; i++) {
+            if (!img_target(&g_ov.chain[i], MAX(ww >> (i + 1), 1u), MAX(wh >> (i + 1), 1u), g_ps.fmt, "blur")) {
+                return;
+            }
+        }
+        unsigned s = 0;
+        VkImageView src = g_ov.comp.view;
+        uint32_t sw = ww, sh = wh;
+        for (unsigned i = 0; i < OV_BLUR; i++) {      /* down */
+            const float extra[4] = { 1.0f / (float)sw, 1.0f / (float)sh, 0, 0 };
+            img_pass_ds(cb, f, f->bset[s++], &g_ov.chain[i], g_ps.pipe[P_KDOWN], src, extra);
+            src = g_ov.chain[i].view;
+            sw = g_ov.chain[i].w;
+            sh = g_ov.chain[i].h;
+            g_ov.chain[i].serial = 1;
+        }
+        for (int i = OV_BLUR - 2; i >= 0; i--) {     /* and up, into the larger */
+            const float extra[4] = { 1.0f / (float)g_ov.chain[i].w, 1.0f / (float)g_ov.chain[i].h, 0, 0 };
+            img_pass_ds(cb, f, f->bset[s++], &g_ov.chain[i], g_ps.pipe[P_KUP], g_ov.chain[i + 1].view, extra);
+        }
+        g_ov.blur_key = k;
+    }
+    set_src(f, f->ovs[1], g_ov.chain[0].view);
+}
+
+/* The overlay's triangles into the window pass open (iw x ih). */
+static void ov_draw(VkCommandBuffer cb, PsFrame *f, uint32_t iw, uint32_t ih, bool scene_ok)
+{
+    const VkDeviceSize n = (VkDeviceSize)g_ov.nv * sizeof(HleOvVert);
+    if (!host_buf(&f->vbuf, &f->vmem, &f->vmap, &f->vsize, n, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)) {
+        return;
+    }
+    if (g_ps.fmt != g_ov.pipe_fmt) {
+        for (unsigned i = 0; i < 3; i++) {
+            if (g_ov.pipe[i]) {
+                T.vkDestroyPipeline(g_hvk.dev, g_ov.pipe[i], NULL);
+            }
+            g_ov.pipe[i] = ov_pipeline(g_ps.fmt, i);
+        }
+        g_ov.pipe_fmt = g_ps.fmt;
+    }
+    memcpy(f->vmap, g_ov.v, (size_t)n);
+    const VkDeviceSize zero = 0;
+    T.vkCmdBindVertexBuffers(cb, 0, 1, &f->vbuf, &zero);
+    VkViewport vp = { 0, 0, (float)iw, (float)ih, 0.0f, 1.0f };
+    T.vkCmdSetViewport(cb, 0, 1, &vp);
+    const float ww = (float)g_ps.wsize.width, wh = (float)g_ps.wsize.height;
+    const float pc[12] = { 2.0f / ww, 2.0f / wh, 0, 0, 0, 0, 0, 0, g_ps.rot[0], g_ps.rot[1], g_ps.rot[2], g_ps.rot[3] };
+    const bool turned = g_ps.rot[0] != 1.0f;  /* clips are the window's: kept only unturned */
+    uint32_t bound = ~0u;
+    for (uint32_t i = 0; i < g_ov.nc; i++) {
+        const HleOvCmd *c = &g_ov.c[i];
+        if (!c->count || c->first + c->count > g_ov.nv || c->blend > HLE_OV_PREMUL || !g_ov.pipe[c->blend]) {
+            continue;
+        }
+        VkDescriptorSet ds;
+        if (c->tex == HLE_OV_SCENE || c->tex == HLE_OV_SCENE_BLUR) {
+            if (!scene_ok || (c->tex == HLE_OV_SCENE_BLUR && g_ov.blur_key != g_ov.comp_key)) {
+                continue;
+            }
+            ds = f->ovs[c->tex == HLE_OV_SCENE ? 0 : 1];
+        } else if (c->tex < OV_TEX_MAX && g_ov.tex[c->tex].state == 2 && g_ov.tex[c->tex].img) {
+            ds = g_ov.tex[c->tex].set;
+        } else {
+            continue;
+        }
+        if (c->blend != bound) {
+            T.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ov.pipe[c->blend]);
+            T.vkCmdPushConstants(cb, g_ps.pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48, pc);
+            bound = c->blend;
+        }
+        VkRect2D sc = { { 0, 0 }, { iw, ih } };
+        if (c->clip[2] > 0 && c->clip[3] > 0 && !turned) {
+            const int32_t x0 = MAX(c->clip[0], 0), y0 = MAX(c->clip[1], 0);
+            const int32_t x1 = MIN(c->clip[0] + c->clip[2], (int32_t)iw);
+            const int32_t y1 = MIN(c->clip[1] + c->clip[3], (int32_t)ih);
+            if (x1 <= x0 || y1 <= y0) {
+                continue;
+            }
+            sc = (VkRect2D){ { x0, y0 }, { (uint32_t)(x1 - x0), (uint32_t)(y1 - y0) } };
+        }
+        T.vkCmdSetScissor(cb, 0, 1, &sc);
+        T.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ps.pl, 0, 1, &ds, 0, NULL);
+        T.vkCmdDraw(cb, c->count, 1, c->first, 0);
+    }
+}
+
+#ifdef _WIN32
+/* The pass done into a shared image: handed over to the frame (its queue
+ * family the external's), our timeline and the frame's drawn one signalled,
+ * the frame told. */
+static void remote_end(VkCommandBuffer cb, PsFrame *f, VkImage dst, bool shot, uint32_t iw, uint32_t ih, uint64_t key)
+{
+    VkImageLayout at = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    VkPipelineStageFlags2 st = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkAccessFlags2 ac = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    if (shot) {
+        barrier(cb, dst, at, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, st, ac, VK_PIPELINE_STAGE_2_COPY_BIT,
+                VK_ACCESS_2_TRANSFER_READ_BIT);
+        VkBufferImageCopy r = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                .imageExtent = { iw, ih, 1 } };
+        T.vkCmdCopyImageToBuffer(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_ps.shot_buf, 1, &r);
+        at = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        st = VK_PIPELINE_STAGE_2_COPY_BIT;
+        ac = 0;
+    }
+    /* to D3D12 (the external queue family), in the layout its COMMON is */
+    VkImageMemoryBarrier2 rel = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = st, .srcAccessMask = ac,
+        .dstStageMask = VK_PIPELINE_STAGE_2_NONE, .dstAccessMask = 0, .oldLayout = at,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = g_hvk.qfam,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL, .image = dst,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    VkDependencyInfo di = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
+                            .pImageMemoryBarriers = &rel };
+    T.vkCmdPipelineBarrier2(cb, &di);
+    T.vkEndCommandBuffer(cb);
+    const uint64_t value = g_ps.submitted + 1, v = g_rm.v + 1;
+    /* Two batches: the picture, its drawing signalling the frame's `ready`
+     * fence = v (a binary semaphore with the D3D12 fence's value, as
+     * RetroArch's present gives it: VkD3D12FenceSubmitInfoKHR); then this
+     * side's timeline, after it. */
+    const VkD3D12FenceSubmitInfoKHR fv = { .sType = VK_STRUCTURE_TYPE_D3D12_FENCE_SUBMIT_INFO_KHR,
+                                           .signalSemaphoreValuesCount = 1, .pSignalSemaphoreValues = &v };
+    const VkTimelineSemaphoreSubmitInfo tv = { .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+                                               .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = &value };
+    const VkSubmitInfo si[2] = {
+        { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &fv, .commandBufferCount = 1,
+          .pCommandBuffers = &cb, .signalSemaphoreCount = 1, .pSignalSemaphores = &g_rm.ready },
+        { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &tv, .signalSemaphoreCount = 1,
+          .pSignalSemaphores = &g_ps.tl } };
+    hle_vk_queue_lock();
+    const int64_t ts0 = hle_now_ns();
+    const VkResult r = T.vkQueueSubmit(g_hvk.queue, 2, si, VK_NULL_HANDLE);
+    g_submit_ns += hle_now_ns() - ts0;
+    hle_vk_queue_unlock();
+    if (g_ps.using) {
+        g_ps.using = false;
+        hle_disp_use_end();
+    }
+    if (r != VK_SUCCESS) {
+        hle_vk_check(r, "vkQueueSubmit (the frame's picture)");
+        g_ps.cur = (g_ps.cur + 1) % PS_FRAMES;
+        return;
+    }
+    g_ps.submitted = value;
+    f->value = value;
+    g_rm.v = v;
+    g_rm.val[g_ps.idx] = v;
+    if (shot && wait_value(value)) {
+        shot_write(iw, ih);
+        g_ps.shot_want = false;
+    }
+    /* when it is due: a frame's first picture (one drawn again for the
+     * overlay over it comes as it is) */
+    {
+        static uint32_t s_due_serial;
+        static LONGLONG s_qpf;
+        const bool first = g_ps.have && g_ps.serial != s_due_serial;
+        s_due_serial = g_ps.serial;
+        LONG64 due = 0;
+        /* this process's clock to the counter's, both read now */
+        struct timespec ts;
+        LARGE_INTEGER c;
+        if (!s_qpf) {
+            LARGE_INTEGER q;
+            QueryPerformanceFrequency(&q);
+            s_qpf = q.QuadPart;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        QueryPerformanceCounter(&c);
+        const LONG64 mono = (LONG64)ts.tv_sec * 1000000000 + ts.tv_nsec;
+        const LONG64 qpc = (LONG64)(c.QuadPart / s_qpf) * 1000000000 + (c.QuadPart % s_qpf) * 1000000000 / s_qpf;
+        if (first && g_ps.f.due_ns) {
+            due = (LONG64)g_ps.f.due_ns + (qpc - mono);
+        }
+        InterlockedExchange64((volatile LONG64 *)&g_rm.sh->src[g_rm.slot].due[g_ps.idx], due);
+        /* the display's vsyncs as the frame has them, for the vblank: with
+         * V-Sync its presents are timed (the lead they keep), without it
+         * they come as before */
+        static uint32_t s_sync_seq;
+        const HleShareSrc *ss = &g_rm.sh->src[g_rm.slot];
+        const uint32_t seq = ss->sync_seq;
+        if (seq != s_sync_seq && ss->sync_ns > 0 && ss->sync_period_ns > 0) {
+            s_sync_seq = seq;
+            hle_host_display_sync((uint64_t)(ss->sync_ns - (qpc - mono)), (uint64_t)ss->sync_period_ns,
+                                  g_vsync && ss->pace_lead_us > 0 ? (uint64_t)ss->pace_lead_us * 1000 : 0);
+        }
+        InterlockedExchange((volatile LONG *)&g_rm.sh->src[g_rm.slot].locked, hle_host_vblank_timed());
+    }
+    /* the newest picture, then the frame woken (it takes the newest it finds) */
+    InterlockedExchange64((volatile LONG64 *)&g_rm.sh->src[g_rm.slot].latest, (LONG64)((v << 2) | g_ps.idx));
+    SetEvent(g_rm.ev);
+    g_ps.shown = true;
+    g_ps.shown_key = key;
+    g_ov.presented++;
+    g_ps.cur = (g_ps.cur + 1) % PS_FRAMES;
+}
+#endif
+
+void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, uint64_t key)
+{
+    g_ps.shown = false;
+    PsFrame *f = &g_ps.fr[g_ps.cur];
+    const uint32_t ww = g_ps.wsize.width, wh = g_ps.wsize.height, iw = g_ps.ext.width, ih = g_ps.ext.height;
+    uint8_t rgb[3][256];
+    bool identity;
+    if (hle_disp_gamma(rgb, &identity, &g_ps.ramp_gen)) {
+        for (unsigned i = 0; i < 256; i++) {
+            for (unsigned c = 0; c < 3; c++) {
+                g_ps.ramp[c][i] = identity ? (uint8_t)i : rgb[c][i];
+            }
+        }
+        for (unsigned i = 0; i < PS_FRAMES; i++) {
+            g_ps.fr[i].ramp_stale = true;  /* a new ramp shows now, with no new frame */
+        }
+    }
+    if (f->ramp_stale) {
+        memcpy(g_ps.ubo_map + (size_t)g_ps.cur * PS_RAMP, g_ps.ramp, 768);
+        f->ramp_stale = false;
+    }
+    T.vkResetCommandPool(g_hvk.dev, f->pool, 0);
+    VkCommandBuffer cb = f->cb;
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    T.vkBeginCommandBuffer(cb, &bi);
+    VkImageView src = g_ps.have ? g_ps.f.view : VK_NULL_HANDLE;
+    bool fxaa_done = false;
+    /* The frame's writes need no barrier here: each writer of a display
+     * image (the swap's blit, the gamma pass, the overlay) ends with one
+     * into SHADER_READ_ONLY over all later commands of the queue, ours too
+     * (a second queue: the CPU saw the frame complete before it was
+     * presented). A barrier of our own drained the GPU at every refresh; a
+     * wait on the render timeline at the frame's value sent the submit down
+     * a slow path on Qualcomm's driver (Halo 2 at 30 fps, Adreno 830). */
+    if (g_ps.have && fxaa && g_ps.pipe[P_FXAA]) {
+        if (img_target(&g_ps.fx, g_ps.f.w, g_ps.f.h, VK_FORMAT_R8G8B8A8_UNORM, "FXAA")) {
+            if (g_ps.fx.serial != g_ps.serial) {
+                static const float none[4];
+                img_pass(cb, f, SET_FXAA, &g_ps.fx, g_ps.pipe[P_FXAA], g_ps.f.view, none);
+                g_ps.fx.serial = g_ps.serial;
+            }
+            src = g_ps.fx.view;
+            fxaa_done = true;
+        } else {
+            g_ps.pipe[P_FXAA] = VK_NULL_HANDLE;     /* no image for it: FXAA off */
+        }
+    }
+    /* the frame's pixels per window pixel: over 1 (either axis) averaged
+     * down, under 1 scaled up as chosen; FSR's EASU into its image first
+     * (a new frame, or a new size), its RCAS on the way into the window */
+    const float vw = sx * (float)ww, vh = sy * (float)wh;
+    const float rx = g_ps.have ? (float)g_ps.f.w / vw : 1.0f, ry = g_ps.have ? (float)g_ps.f.h / vh : 1.0f;
+    const bool down = (rx > 1.01f || ry > 1.01f) && average && g_ps.pipe[P_AREA];
+    bool fsr = g_ps.have && !down && !g_crt && (rx < 0.99f || ry < 0.99f) && upscale == HLE_UPSCALE_FSR &&
+               g_ps.pipe[P_EASU] && g_ps.pipe[P_RCAS];
+    if (fsr && !img_target(&g_ps.up, (uint32_t)(vw + 0.5f), (uint32_t)(vh + 0.5f), VK_FORMAT_R8G8B8A8_UNORM, "FSR")) {
+        g_ps.pipe[P_EASU] = VK_NULL_HANDLE;         /* no image for it: bilinear */
+        fsr = false;
+    }
+    if (fsr && (g_ps.up.serial != g_ps.serial || g_ps.up.fxaa != fxaa_done)) {
+        const float extra[4] = { (float)g_ps.f.w, (float)g_ps.f.h, (float)g_ps.up.w, (float)g_ps.up.h };
+        img_pass(cb, f, SET_EASU, &g_ps.up, g_ps.pipe[P_EASU], src, extra);
+        g_ps.up.serial = g_ps.serial;
+        g_ps.up.fxaa = fxaa_done;
+    }
+    /* the picture's pass: p over the frame's place, from `from` */
+    unsigned p = P_BILINEAR;
+    float pc[12] = { -sx, -sy, sx, sy, 0.0f, 0.0f, 0.0f, 0.0f, g_ps.rot[0], g_ps.rot[1], g_ps.rot[2], g_ps.rot[3] };
+    VkImageView from = src;
+    if (down) {
+        p = P_AREA;
+        pc[4] = rx;
+        pc[5] = ry;
+    } else if (fsr) {
+        p = P_RCAS;
+        pc[4] = 0.8705506f;                 /* sharpness 0.2 stops: 2^-0.2 (FsrRcasCon, AMD's sample's) */
+        from = g_ps.up.view;
+    }
+    if (g_crt && g_ps.pipe[P_CRT]) {
+        p = P_CRT;
+        pc[4] = (float)g_crt;
+        pc[5] = (float)hle_host_render_scale();
+        from = src;
+    }
+    /* the overlay: its textures first, the picture as one under a cover */
+    const bool ov = g_ov.on && ov_init();
+    g_ov_shown = ov;
+    const bool cover = ov && (g_ov.flags & HLE_OV_COVER);
+    bool scene_ok = false;
+    if (ov || (g_ov.ok && g_ov.dirty)) {
+        ov_textures(cb, f);
+    }
+    if (ov) {
+        if (cover && (g_ov.scene || g_ov.blur)) {
+            ov_scene(cb, f, p, pc, from, key);
+            scene_ok = g_ov.comp.serial != 0;
+        }
+    }
+    VkImage dst = g_ps.img[g_ps.idx];
+#ifdef _WIN32
+    if (g_rm.on) {
+        /* the frame's image back from D3D12 (the external queue family) */
+        VkImageMemoryBarrier2 acq = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+            .dstQueueFamilyIndex = g_hvk.qfam, .image = dst, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+        VkDependencyInfo adi = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
+                                 .pImageMemoryBarriers = &acq };
+        T.vkCmdPipelineBarrier2(cb, &adi);
+    } else
+#endif
+    barrier(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    rendering(cb, g_ps.view[g_ps.idx], iw, ih, true);
+    if (g_ps.have && !cover) {
+        g_smp_near = p == P_BILINEAR && upscale == HLE_UPSCALE_NEAREST;
+        quad_clipped(cb, f, SET_WINDOW, g_ps.pipe[p], from, pc, iw, ih);
+        g_smp_near = false;
+        if (g_osd > 0 && g_ps.pipe[P_OSD]) {
+            /* top left, 4 digits each 0.022 of the window's height wide */
+            const float dh = 0.045f, dw = dh * 0.62f * (float)wh / (float)ww;
+            float oc[12] = { -0.98f, -0.97f, -0.98f + 4 * dw * 2, -0.97f + dh * 2, g_osd, 0, 0, 0,
+                             g_ps.rot[0], g_ps.rot[1], g_ps.rot[2], g_ps.rot[3] };
+            quad(cb, f, SET_OSD, g_ps.pipe[P_OSD], src, oc, iw, ih);
+        }
+        log_path(p, fxaa_done, (uint32_t)(vw + 0.5f), (uint32_t)(vh + 0.5f));
+    }
+    if (ov) {
+        ov_draw(cb, f, iw, ih, scene_ok);
+    }
+    T.vkCmdEndRendering(cb);
+    bool shot = false;
+    if (g_ps.shot_want) {
+        if (!g_ps.shot_can) {
+            shot_ended(false, "the window's pictures can't be copied (its swapchain has no transfer source)");
+            g_ps.shot_want = false;
+        } else if (!shot_buf((VkDeviceSize)iw * ih * 4)) {
+            shot_ended(false, "no memory for its copy");
+            g_ps.shot_want = false;
+        } else {
+            shot = true;
+        }
+    }
+#ifdef _WIN32
+    if (g_rm.on) {
+        remote_end(cb, f, dst, shot, iw, ih, key);
+        return;
+    }
+#endif
+    if (shot) {
+        barrier(cb, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        VkBufferImageCopy r = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                .imageExtent = { iw, ih, 1 } };
+        T.vkCmdCopyImageToBuffer(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_ps.shot_buf, 1, &r);
+        barrier(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_NONE, 0);
+    } else {
+        barrier(cb, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_NONE, 0);
+    }
+    T.vkEndCommandBuffer(cb);
+
+    /* The present waits for the pass on the GPU: Turnip's hands the
+     * compositor a fence over it (Mesa's vk_android.c: a submit and a sync
+     * file), and the window's thread goes on to the next refresh. Waiting
+     * for the pass here, behind the game's frames on the one queue, held
+     * the thread past refreshes whenever the GPU was busy, and the next
+     * front frame was replaced before it was picked up ("UI missed").
+     * HLE_QUIRK_PRESENT_CPU_WAIT: the image is presented once it's drawn,
+     * with nothing left to wait for. Presenting with a semaphore to wait on
+     * made Android's present ask Qualcomm's driver for a fence over it,
+     * which waited (3-6 ms a refresh) with the queue's lock held, the render
+     * thread's submits waiting on it; Halo 2 lost 2% of its frames to GL's
+     * presenter. The wait is ours there, unlocked. */
+    const bool cpu_wait = hle_quirk(HLE_QUIRK_PRESENT_CPU_WAIT);
+    const uint64_t value = g_ps.submitted + 1;
+    VkSemaphoreSubmitInfo wait = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = f->acquired,
+                                   .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT };
+    VkSemaphoreSubmitInfo sig[2] = {
+        { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_ps.tl, .value = value,
+          .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT },
+        { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_ps.drawn[g_ps.idx],
+          .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT } };
+    VkCommandBufferSubmitInfo cbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb };
+    VkSubmitInfo2 si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = 1,
+                         .pWaitSemaphoreInfos = &wait, .commandBufferInfoCount = 1,
+                         .pCommandBufferInfos = &cbi, .signalSemaphoreInfoCount = cpu_wait ? 1 : 2,
+                         .pSignalSemaphoreInfos = sig };
+    VkPresentInfoKHR pi = { .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = cpu_wait ? 0 : 1,
+                            .pWaitSemaphores = &g_ps.drawn[g_ps.idx], .swapchainCount = 1,
+                            .pSwapchains = &g_ps.sc, .pImageIndices = &g_ps.idx };
+    hle_vk_queue_lock();
+    const int64_t ts0 = hle_now_ns();
+    VkResult r = T.vkQueueSubmit2(g_hvk.queue, 1, &si, VK_NULL_HANDLE);
+    g_submit_ns += hle_now_ns() - ts0;
+    hle_vk_queue_unlock();
+    if (r == VK_SUCCESS) {
+        g_ps.submitted = value;
+        f->value = value;
+        if (shot && wait_value(value)) {
+            shot_write(iw, ih);
+            g_ps.shot_want = false;
+        }
+    } else {
+        hle_vk_check(r, "vkQueueSubmit2 (present)");
+    }
+    if (g_ps.using) {
+        g_ps.using = false;
+        hle_disp_use_end();
+    }
+    VkResult pr = r;
+    if (r == VK_SUCCESS) {
+        if (cpu_wait) {
+            const int64_t tw0 = hle_now_ns();
+            wait_value(value);          /* (timed out: presented all the same, or the image stays ours) */
+            g_wait_ns += hle_now_ns() - tw0;
+        }
+        hle_vk_queue_lock();
+        const int64_t tp0 = hle_now_ns();
+        pr = T.vkQueuePresentKHR(g_hvk.queue, &pi);
+        g_present_ns += hle_now_ns() - tp0;
+        hle_vk_queue_unlock();
+    }
+    if (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR) {
+        g_ps.shown = true;
+        g_ps.shown_key = key;
+        g_ov.presented++;
+    }
+    if (pr == VK_ERROR_OUT_OF_DATE_KHR || (pr == VK_SUBOPTIMAL_KHR && g_ps.follows)) {
+        g_ps.stale = true;
+    } else if (pr == VK_ERROR_SURFACE_LOST_KHR) {
+        lose_window();
+    } else if (pr == VK_ERROR_DEVICE_LOST) {
+        hle_vk_lose(pr, "vkQueuePresentKHR");
+    }
+    g_ps.cur = (g_ps.cur + 1) % PS_FRAMES;
+    static int64_t s_t0;
+    const int64_t now = hle_now_ns();
+    if (!s_t0) {
+        s_t0 = now;
+    } else if (now - s_t0 >= 10000000000ll) {
+        const double s = (now - s_t0) / 1e9;
+        hle_log("xbased-hle-back", "present: the queue's lock waited for %.1f ms/s; the presenter's submits "
+                "held it %.1f ms/s, its presents %.1f; it waited %.1f ms/s for its passes (%s), %.1f for images",
+                hle_vk_queue_wait_ns() / 1e6 / s, g_submit_ns / 1e6 / s, g_present_ns / 1e6 / s,
+                g_wait_ns / 1e6 / s,
+                hle_quirk(HLE_QUIRK_PRESENT_CPU_WAIT) ? "each before its present" : "the present waits on the GPU",
+                g_acquire_ns / 1e6 / s);
+        g_submit_ns = g_present_ns = g_wait_ns = g_acquire_ns = 0;
+        s_t0 = now;
+    }
+}

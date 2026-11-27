@@ -1,0 +1,160 @@
+/*
+ * xbased HLE GPU — Xbox pixel shaders (NV2A register combiners and texture
+ * modes) -> GLSL 4.50 (spec §5.8; pure). The key is the pixel-shader
+ * render-state block (5659 render states 0..56, which SetPixelShader loads
+ * from the D3DPIXELSHADERDEF); the combiner constants are push constants.
+ *
+ * Interface: inputs location 0 vDiffuse, 1 vSpecular, 2..5 vTex0..3, 6 vFog
+ * (as vsh.h / ff.h); set 0 bindless images and samplers; HleFfPush.
+ */
+#ifndef HW_XBOX_HLE_SHADER_PSH_H
+#define HW_XBOX_HLE_SHADER_PSH_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+/* D3DPIXELSHADERDEF / render-state indices (5659: D3DRS_PSALPHAINPUTS0 = 0) */
+enum {
+    HLE_PS_ALPHA_IN = 0,                /* [8] */
+    HLE_PS_FINAL_ABCD = 8,
+    HLE_PS_FINAL_EFG = 9,
+    HLE_PS_C0 = 10,                     /* [8] */
+    HLE_PS_C1 = 18,                     /* [8] */
+    HLE_PS_ALPHA_OUT = 26,              /* [8] */
+    HLE_PS_RGB_IN = 34,                 /* [8] */
+    HLE_PS_COMPARE = 42,
+    HLE_PS_FINAL_C0 = 43,
+    HLE_PS_FINAL_C1 = 44,
+    HLE_PS_RGB_OUT = 45,                /* [8] */
+    HLE_PS_COUNT = 53,
+    HLE_PS_TEXMODES = 54,
+    HLE_PS_DOTMAP = 55,
+    HLE_PS_INPUTTEX = 56,
+    HLE_PS_REGS = 57,
+};
+
+/* PSTextureModes values */
+enum {
+    HLE_PST_NONE = 0, HLE_PST_PROJECT2D, HLE_PST_PROJECT3D, HLE_PST_CUBEMAP,
+    HLE_PST_PASSTHRU, HLE_PST_CLIPPLANE, HLE_PST_BUMPENVMAP, HLE_PST_BUMPENVMAP_LUM,
+    HLE_PST_BRDF, HLE_PST_DOT_ST, HLE_PST_DOT_ZW, HLE_PST_DOT_RFLCT_DIFF,
+    HLE_PST_DOT_RFLCT_SPEC, HLE_PST_DOT_STR_3D, HLE_PST_DOT_STR_CUBE, HLE_PST_DPNDNT_AR,
+    HLE_PST_DPNDNT_GB, HLE_PST_DOTPRODUCT, HLE_PST_DOT_RFLCT_SPEC_CONST,
+};
+
+typedef struct HlePshKey {
+    uint32_t rgb_in[8], rgb_out[8], alpha_in[8], alpha_out[8];
+    uint32_t final_abcd, final_efg;
+    uint32_t count;                     /* PSCombinerCount */
+    uint32_t tex_modes;                 /* PSTextureModes */
+    uint32_t dot_map;                   /* PSDotMapping */
+    uint32_t input_tex;                 /* PSInputTexture */
+    uint32_t compare;                   /* PSCompareMode */
+    uint32_t ckey[4];                   /* the stages' colour keys (A8R8G8B8), where one is on
+                                           (HLE_PSH_CKEY): its alpha 0 where the texture's
+                                           format has none */
+    uint8_t alpha_test;                 /* ALPHATESTENABLE */
+    uint8_t alpha_func;                 /* D3DCMP_* - 0x200 (0..7) */
+    uint8_t flat;
+    uint8_t fog;                        /* 0 off; FOGTABLEMODE + 1 (NONE 1 .. LINEAR 4) */
+    uint8_t fog_abs;                    /* the factor of |distance|: an NV2A _ABS fog mode
+                                           the title pushed (D3D's are never _ABS) */
+    uint8_t debug;                      /* output instead: 1 t0, 2 v0, 3 r0, 4 fog, 5 v1,
+                                           6 t3, 7 r0.a, 8 t2, 9 shadow bands, 10 v1.a,
+                                           11 t0.a, 12 t3.a, 13 fract(T3 s/q, t/q),
+                                           14 |T3 str| / 4, 15 t3 and 16 t0 as sampled,
+                                           17 shadow-buffer draws: (stored depth, r,
+                                           result) / range, unblended; 18 magenta,
+                                           19 t1, 20 r1, 21 |T2 str| / 4, 22 T2 str
+                                           direction, 23 T2 NaN / Inf, 24 stage 2's
+                                           cube along (0.3, 0.5, 0.8) */
+    uint8_t point_sprite;               /* POINTSPRITEENABLE on a point list: texture
+                                           unit 3's coordinates are the point's */
+    /* Shadow buffers: stages whose texture is a depth surface (bits 0-3),
+     * D3DRS_SHADOWFUNC - 0x200 (bits 4-6); per stage (2 bits) the depth
+     * range the r coordinate is in: 1 D24 (2^24 - 1), 2 D16, 3 float. */
+    uint8_t shadow;
+    uint8_t shadow_fmt;
+    uint8_t out_bgra;                   /* 8-bit (B8) target: it stores blue */
+    uint8_t alpha_kill;                 /* stages with D3DTSS_ALPHAKILL (bits 0-3) */
+    uint8_t vol;                        /* stages whose texture is a volume (bits 0-3):
+                                           2D-coordinate modes fetch it in 3D, as the NV2A
+                                           (LLE): PROJECT2D at r = 0, bump-env at the
+                                           coordinates' r; HLE_PSH_RECT: the stage the
+                                           push block's fog.w names has its linear
+                                           texture kept to its own size, part of a
+                                           larger surface (ff.h HLE_NVRECT_GLSL);
+                                           HLE_PSH_RECT4: each stage by its word of
+                                           pc.scr (vertex programs); HLE_PSH_ZCUT:
+                                           the depth cut to a D24 buffer's
+                                           steps; bit 7 free */
+    uint8_t wbuf;                       /* W-buffering: depth = vW (HLE_WBUF_*_GLSL) */
+    uint8_t fbfetch;                    /* stages (bits 0-3) whose texture is the colour
+                                           target drawn into: its pixel, read as the
+                                           input attachment (set 2) */
+    uint8_t specular;                   /* SPECULARENABLE: D3D's own final combiner adds
+                                           v1 (a shader without one) */
+    uint8_t sblend;                     /* the NV2A's signed blend equations (ff.h
+                                           HleFfPsKey.sblend) */
+    uint8_t dither;                     /* SET_DITHER_ENABLE into a 16-bit target: the colour
+                                           dithered to its channels' steps as it is written,
+                                           1 R5G6B5, 2 X1R5G5B5 / A1R5G5B5 (vk/draw.c
+                                           dither_mode, HLE_DITHER_GLSL; for the
+                                           fixed-function stages' keys as well) */
+} HlePshKey;
+/* The NV2A's dither into a 16-bit target, a 4x4 ordered pattern added below
+ * the channels' step before the colour is rounded to it: m the step's
+ * fraction of 1 per channel (1/31, 1/63 or 1/31). Above 1x the pattern is the
+ * scaled image's pixels', finer than the console's, as the steps it hides
+ * (without it Fable's sky had its light in rings from 2x) */
+#define HLE_DITHER_GLSL \
+    "float nvbayer() {\n" \
+    "  uvec2 q = uvec2(gl_FragCoord.xy) & 3u;\n" \
+    "  const float b[16] = float[16](0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0,\n" \
+    "                                3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);\n" \
+    "  return (b[q.y * 4u + q.x] + 0.5) / 16.0;\n" \
+    "}\n" \
+    "vec3 nvdither(vec3 c, vec3 m) { return clamp(c + (nvbayer() - 0.5) * m, 0.0, 1.0); }\n"
+/* HlePshKey.dot_map's bits 16-31 (PSDotMapping has 12): per stage, 4 bits each
+ * (stage 0 lowest), the channels its texture holds as signed bytes,
+ * SET_TEXTURE_FILTER 31:28 (bit 0 A, 1 R, 2 G, 3 B). There, a key without any
+ * is the same bytes as before, and recorded pipelines stay valid. */
+#define HLE_PSH_TSIGN(k) ((k)->dot_map >> 16)
+/* bits 12-15: a signed stage (bit 12 + stage) whose texture is magnified
+ * point-sampled: its four texels are not blended (psh.c samps) */
+#define HLE_PSH_TPOINT(k) (((k)->dot_map >> 12) & 15)
+/* HlePshKey.input_tex bits 0-3 (PSInputTexture uses 16, 20-21): a signed
+ * stage (bit = stage) whose texture was defined with its signed bytes
+ * flipped (hle_tex_sign_xor): read centred on 0x80, filtered as signed. */
+#define HLE_PSH_TFLIP(k) ((k)->input_tex & 15)
+/* HlePshKey.tex_modes bits 20-27 (PSTextureModes has 20): per stage, 2 bits
+ * (stage 0 lowest), the colour key's operation, SET_TEXTURE_CONTROL0 1:0: a
+ * fetched texel equal to the stage's SET_COLOR_KEY_COLOR (ckey) has its
+ * alpha 0 (1), is (0, 0, 0, 0) (2), or the pixel is not drawn (3). Bits
+ * 28-31: the stage's texture format has no alpha, and the key's alpha is
+ * not compared (X1R5G5B5, X8R8G8B8). */
+#define HLE_PSH_CKEY(k, s) (((k)->tex_modes >> (20 + 2 * (s))) & 3u)
+#define HLE_PSH_CKEY_NOALPHA(k, s) (((k)->tex_modes >> (28 + (s))) & 1u)
+#define HLE_PSH_CKEY_BITS(s, op, noalpha) \
+    ((uint32_t)((op) & 3u) << (20 + 2 * (s)) | (uint32_t)((noalpha) ? 1u : 0u) << (28 + (s)))
+/* HlePshKey.compare bits 16-19 (PSCompareMode has 16): the stage's texture is
+ * of another kind than its mode fetches, and is read as the NV2A reads it
+ * (psh.c): a 2D texture under a mode that fetches a cube (CUBEMAP,
+ * DOT_STR_CUBE, DOT_RFLCT_DIFF, DOT_RFLCT_SPEC) or a volume (DOT_STR_3D), a
+ * cube under PROJECT2D. */
+#define HLE_PSH_TKIND(k, s) (((k)->compare >> (16 + (s))) & 1u)
+#define HLE_PSH_TKIND_BIT(s) (1u << (16 + (s)))
+#define HLE_PSH_RECT 0x10u              /* HlePshKey.vol: a linear texture kept to its size */
+#define HLE_PSH_RECT4 0x20u             /* HlePshKey.vol: each stage's in pc.scr (programs) */
+#define HLE_PSH_ZCUT 0x40u              /* HlePshKey.vol: a D24 buffer held as a float image
+                                           (no D24S8, vk/draw.c): the depth stored cut to its
+                                           2^24 - 1 steps, as the integer buffer converts it */
+
+/* Key from the render-state array (rs[0..56] = the pixel-shader block). */
+void hle_psh_key(const uint32_t *rs, HlePshKey *k);
+
+/* GLSL into buf; returns its length, 0 when it does not fit. Unsupported
+ * texture modes sample as PROJECT2D and set *unsupported (may be NULL). */
+size_t hle_psh_glsl(const HlePshKey *k, char *buf, size_t cap, unsigned *unsupported);
+
+#endif
