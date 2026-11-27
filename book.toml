@@ -1,0 +1,17 @@
+# The documentation site (docs.xbemu.org): the pages of docs/, built by
+# tools/build-docs.sh, which adds the rustdoc under reference/.
+[book]
+title = "xbemu"
+description = "An original Xbox emulator core in Rust"
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "target/site"
+create-missing = false
+
+[output.html]
+cname = "docs.xbemu.org"
+git-repository-url = "https://github.com/emuforge/xbemu"
+edit-url-template = "https://github.com/emuforge/xbemu/edit/main/{path}"
+site-url = "/"
