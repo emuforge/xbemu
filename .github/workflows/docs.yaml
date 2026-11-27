@@ -59,6 +59,9 @@ jobs:
           XBEMU_BUILD_IMAGE: xbemu-build:ci
         run: |
           tools/in-container.sh bash -euo pipefail -c '
+            # in-container.sh points CARGO_HOME into the checkout, so the bin
+            # that cargo install fills is not on the PATH of the image
+            export PATH="${CARGO_HOME}/bin:${PATH}"
             tools/fetch-deps.sh
             cargo install --locked --quiet --version "'"${MDBOOK_VERSION}"'" mdbook
             tools/build-docs.sh
