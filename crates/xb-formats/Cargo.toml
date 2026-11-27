@@ -1,0 +1,23 @@
+[package]
+name = "xb-formats"
+description = "Disc image and executable formats: CCI, XDVDFS (XISO), XBE."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+xb-types = { path = "../xb-types" }
+log = "0.4.29"
+# MIT. Safe-Rust LZ4 block codec; the frame format is not used.
+lz4_flex = { version = "0.14.0", default-features = false, features = ["std", "safe-decode", "safe-encode", "checked-decode"] }
+
+[dev-dependencies]
+# The titles stash: finds the game images a developer has linked in.
+xb-testkit = { path = "../xb-testkit" }
