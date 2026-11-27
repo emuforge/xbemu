@@ -1,0 +1,27 @@
+[package]
+name = "xb-apu"
+description = "MCPX audio processor: the vendored C behind a Rust interface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = ["dsp-recompiler"]
+# The GP DSP's program compiled to host code (x86-64 hosts only; elsewhere, and
+# without this feature, the DSP interpreter runs it).
+dsp-recompiler = []
+
+[dependencies]
+log = "0.4.35"
+xb-types = { path = "../xb-types" }
+
+[build-dependencies]
+cc = "1.2.60"
