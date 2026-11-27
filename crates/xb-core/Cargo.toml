@@ -1,0 +1,41 @@
+[package]
+name = "xb-core"
+description = "The machine: boot, run loop, device wiring, settings; the one API front ends use."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+xb-types = { path = "../xb-types" }
+xb-cpu = { path = "../xb-cpu" }
+xb-mem = { path = "../xb-mem" }
+xb-formats = { path = "../xb-formats" }
+xb-fs = { path = "../xb-fs" }
+xb-kernel = { path = "../xb-kernel" }
+xb-devices = { path = "../xb-devices" }
+xb-gpu = { path = "../xb-gpu" }
+xb-apu = { path = "../xb-apu" }
+xb-menu = { path = "../xb-menu" }
+log = "0.4"
+# The savestate's compression (the tree's LZ4, as the disc images'). MIT.
+lz4_flex = { version = "0.14.0", default-features = false, features = ["std", "safe-decode", "safe-encode", "checked-decode"] }
+
+[target.'cfg(unix)'.dependencies]
+# MIT OR Apache-2.0. clock_gettime(CLOCK_MONOTONIC), the clock the renderer
+# exchanges host instants in.
+libc = "0.2.190"
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+xb-cpu-kvm = { path = "../xb-cpu-kvm" }
+xb-cpu-x64 = { path = "../xb-cpu-x64" }
+
+[dev-dependencies]
+# The titles stash: finds the game images a developer has linked in.
+xb-testkit = { path = "../xb-testkit" }
