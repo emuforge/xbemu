@@ -60,7 +60,7 @@ xbemu <disc image> [--data-dir DIR] [--fullscreen] [--log LEVEL]
 
 | Path | What |
 |---|---|
-| `settings.txt` | the settings, `key = value` lines (`xb_types::settings`); written when the menu changes one and at shutdown. `menu_combo` is a mask of pad buttons that open the menu when held together, `0x0000` for none (the default) |
+| `settings.txt` | the settings, `key = value` lines (`xb_types::settings`); written when the menu changes one and at shutdown. `menu_combo` is a mask of pad buttons that open the menu when held together, `0x0000` for none (the default). `host_performance` (on by default, no menu row) asks the host's power profiles service for its performance profile while a title runs: set it to `false` when measuring how a title runs under the host's own power settings |
 | `eeprom.bin` | the console's EEPROM, made at the first boot |
 | `hdd/PartitionN/` | the hard disk's partitions 1 and 2 as host folders (saves under `Partition1/UDATA/<title id>`) |
 | `hdd/cache/<title id>/` | that title's cache partitions (`Partition3` to `Partition5`) and what is kept of their raw sectors |

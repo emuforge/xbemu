@@ -53,6 +53,11 @@ pub struct Settings {
     /// console drives' speeds. Loading is several times shorter; the few
     /// titles known to need the console's timing keep it regardless.
     pub fast_disc: bool,
+    /// Ask the host to hold its performance power profile while a title
+    /// runs, where the host has a service to ask. A host that saves power
+    /// keeps its clocks low under a title's short bursts of work, and frames
+    /// come late.
+    pub host_performance: bool,
     /// Output volume, 0 to 100.
     pub volume: u8,
     /// CPU backend choice; takes effect at the next boot.
@@ -81,6 +86,7 @@ impl Default for Settings {
             show_fps: false,
             fullscreen: false,
             fast_disc: true,
+            host_performance: true,
             volume: 100,
             cpu: CpuBackend::Auto,
             menu_combo: 0,
@@ -124,6 +130,7 @@ impl Settings {
                 "show_fps" => s.show_fps = flag(),
                 "fullscreen" => s.fullscreen = flag(),
                 "fast_disc" => s.fast_disc = flag(),
+                "host_performance" => s.host_performance = flag(),
                 "volume" => {
                     if let Ok(v @ 0..=100) = value.parse() {
                         s.volume = v;
@@ -163,7 +170,7 @@ impl Settings {
         };
         format!(
             "render_scale = {}\naspect = {aspect}\nwidescreen = {}\nfxaa = {}\nanisotropy = {}\n\
-             vsync = {}\nshow_fps = {}\nfullscreen = {}\nfast_disc = {}\nvolume = {}\ncpu = {cpu}\nmenu_combo = 0x{:04x}\n",
+             vsync = {}\nshow_fps = {}\nfullscreen = {}\nfast_disc = {}\nhost_performance = {}\nvolume = {}\ncpu = {cpu}\nmenu_combo = 0x{:04x}\n",
             self.render_scale,
             self.widescreen,
             self.fxaa,
@@ -172,6 +179,7 @@ impl Settings {
             self.show_fps,
             self.fullscreen,
             self.fast_disc,
+            self.host_performance,
             self.volume,
             self.menu_combo,
         )
@@ -195,6 +203,7 @@ mod tests {
             show_fps: true,
             fullscreen: true,
             fast_disc: false,
+            host_performance: false,
             volume: 40,
             cpu: CpuBackend::Translator,
             menu_combo: button::BACK | button::START,

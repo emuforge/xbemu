@@ -22,6 +22,7 @@ A handful of titles have been run.
 | In-game menu | Guide button, F1 or Escape; pauses the title; settings are saved |
 | Savestates | ten slots a title, with pictures; a title can start from one (`--state`) |
 | Disc speed | console speed or fast loading, switchable while a title runs |
+| Host power | on Linux the host's power profiles service is asked to hold its performance profile while a title runs, and given it back at exit; `host_performance = false` in `settings.txt` leaves the host as it is set |
 
 ## Titles
 

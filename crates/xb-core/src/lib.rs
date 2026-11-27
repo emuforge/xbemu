@@ -34,6 +34,7 @@ mod guest;
 mod host;
 mod machine;
 mod pacing;
+mod power;
 mod script;
 mod slots;
 mod state;
@@ -230,6 +231,8 @@ pub struct Core {
     console_widescreen: bool,
     guest: Mutex<Option<JoinHandle<()>>>,
     ui: Mutex<Ui>,
+    /// The hold on the host's performance profile (the setting).
+    power: power::Power,
 }
 
 /// The slot a script's `save=` or `load=` names when it is a number.
@@ -377,7 +380,10 @@ impl Core {
             log::info!(target: "core", "{SCRIPT_ENV}: a scripted session");
         }
         let now = Instant::now();
+        let power = power::Power::default();
+        power.set(settings.host_performance);
         Ok(Self {
+            power,
             shared: booted.shared,
             pads,
             data_dir,
@@ -507,6 +513,9 @@ impl Core {
             } else {
                 self.shared.control.set_device_timing(guest::disc_speed(new.fast_disc));
             }
+        }
+        if old.host_performance != new.host_performance {
+            self.power.set(new.host_performance);
         }
         if old.volume != new.volume
             && let Some(apu) = self.shared.apu()
@@ -1180,6 +1189,7 @@ impl Core {
     fn stop(&self) {
         let Some(thread) = lock(&self.guest).take() else { return };
         log::info!(target: "core", "shutting down");
+        self.power.set(false);
         {
             let mut run = lock(&self.shared.run);
             run.quit = true;
@@ -1237,6 +1247,7 @@ fn describe_change(old: &Settings, new: &Settings) -> String {
     note("show FPS", old.show_fps.to_string(), new.show_fps.to_string());
     note("fullscreen", old.fullscreen.to_string(), new.fullscreen.to_string());
     note("fast disc", old.fast_disc.to_string(), new.fast_disc.to_string());
+    note("host performance", old.host_performance.to_string(), new.host_performance.to_string());
     note("volume", old.volume.to_string(), new.volume.to_string());
     note("cpu", format!("{:?}", old.cpu), format!("{:?}", new.cpu));
     note("menu combo", format!("{:04x}", old.menu_combo), format!("{:04x}", new.menu_combo));
