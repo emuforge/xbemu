@@ -52,6 +52,9 @@ pub(crate) struct HleOvCmd {
 pub(crate) const HLE_OV_BLEND: u32 = 0;
 /// `HLE_UPSCALE_BILINEAR`.
 pub(crate) const HLE_UPSCALE_BILINEAR: c_int = 0;
+/// `hle_present_end`'s `down`: no downsampling, the frame shown at its
+/// render scale.
+pub(crate) const DOWNSAMPLE_OFF: c_int = 0;
 
 /// `HleDispStats` (`vk/display.h`).
 #[repr(C)]
@@ -125,7 +128,7 @@ unsafe extern "C" {
     fn hle_pb_overlay_changed(show: bool);
     fn hle_pb_display_start(pa: u32);
     fn hle_pb_vblank();
-    pub(crate) fn hle_pb_display_mode(pitch: u32, xfmt: u32, hz: c_uint);
+    pub(crate) fn hle_pb_display_mode(pitch: u32, xfmt: u32, hz: c_uint, w: u32);
     pub(crate) fn hle_pb_display_fb(pa: u32);
 
     // mem/barrier.h, vk/back.h
@@ -172,6 +175,7 @@ unsafe extern "C" {
         fxaa: bool,
         upscale: c_int,
         average: bool,
+        down: c_int,
         key: u64,
     );
     pub(crate) fn hle_present_set_clip(cx: f32, cy: f32);
@@ -582,6 +586,12 @@ pub extern "C" fn hle_host_frame_flipped() {
     }
 }
 
+/// `hle_host_frame_holds_timed_out`.
+#[unsafe(no_mangle)]
+pub extern "C" fn hle_host_frame_holds_timed_out() -> u32 {
+    shared().map_or(0, |s| s.host.frame_holds_timed_out())
+}
+
 /// `hle_host_flip_min_ns`.
 #[unsafe(no_mangle)]
 pub extern "C" fn hle_host_flip_min_ns() -> i64 {
@@ -850,6 +860,7 @@ pub fn exported_symbols() -> Vec<(&'static str, usize)> {
         ("hle_host_flip_vblank_ns", hle_host_flip_vblank_ns as *const () as usize),
         ("hle_host_frame_wait", hle_host_frame_wait as *const () as usize),
         ("hle_host_frame_flipped", hle_host_frame_flipped as *const () as usize),
+        ("hle_host_frame_holds_timed_out", hle_host_frame_holds_timed_out as *const () as usize),
         ("hle_host_flip_min_ns", hle_host_flip_min_ns as *const () as usize),
         ("hle_host_flip_slot", hle_host_flip_slot as *const () as usize),
         ("hle_host_display_sync", hle_host_display_sync as *const () as usize),

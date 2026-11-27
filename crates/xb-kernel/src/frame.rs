@@ -31,6 +31,8 @@ struct Shared {
     request: AtomicU32,
     /// A thread is held.
     held: AtomicBool,
+    /// Holds that ended at their deadline with no flip come.
+    timeouts: AtomicU32,
 }
 
 /// The renderer's side of the hold: asks for one and reports flips. Clones
@@ -55,6 +57,16 @@ impl FrameHold {
     pub fn flipped(&self) -> bool {
         self.0.flips.fetch_add(1, Ordering::AcqRel);
         self.0.held.load(Ordering::Acquire)
+    }
+
+    /// The holds so far that ended at their longest with no flip come. The
+    /// renderer gives the holds up while this count grows
+    /// (`hle_host_frame_holds_timed_out`), as the reference does: a title
+    /// whose flips do not come by its holds only loses 50 ms to each (Crazy
+    /// Taxi 3 after a few levels).
+    #[must_use]
+    pub fn timed_out(&self) -> u32 {
+        self.0.timeouts.load(Ordering::Acquire)
     }
 
     /// A savestate's flip count, and whether a thread it holds waits on it.
@@ -126,8 +138,12 @@ impl Kernel {
         }
     }
 
-    /// A hold ended (`check_waits`).
-    pub(crate) fn frame_hold_ended(&mut self) {
+    /// A hold ended (`check_waits`); `timed_out`: at its deadline, no flip
+    /// come.
+    pub(crate) fn frame_hold_ended(&mut self, timed_out: bool) {
         self.flip_hold.0.held.store(false, Ordering::Release);
+        if timed_out {
+            self.flip_hold.0.timeouts.fetch_add(1, Ordering::AcqRel);
+        }
     }
 }

@@ -102,6 +102,7 @@ static struct {
     uint32_t trap_flips;                /* ... the flips counted as it came (pace_flip) */
     int64_t pace_until;                 /* a flip in a trap's handler: no further till then */
     int64_t pace_slot;                  /* ... the last one's slot on the limit's grid */
+    uint32_t pace_flips;                /* ... the flips counted by then (g_fl_flips) */
     uint64_t paced;                     /* ... holds */
     uint32_t sub_r[8][0x400 / 4];       /* the 2D objects' methods, by subchannel */
     uint32_t s2d[0x400 / 4];            /* the 2D surfaces' (one at a time in D3D) */
@@ -128,6 +129,7 @@ static struct {
 } g_pb;
 
 static uint32_t g_fl_flips;             /* flips so far (hle_pb_flip_read) */
+static int64_t g_trap_flip_ns;          /* the last flip a trap's handler did (hle_pb_flips_in_traps) */
 
 /* The report gate on (g_sc_gate, XBASED_HLE_PB_VISGATE), and the report
  * scout reading the guest's pushes (g_sc_on): only once the decoder has met
@@ -142,23 +144,26 @@ bool hle_pb_active(void)
     return g_pb.on;
 }
 
-static uint64_t g_disp_mode;            /* pitch | xfmt << 32 | hz << 48, 0: none */
+static uint64_t g_disp_mode;            /* pitch | xfmt << 32 | hz << 48 | width / 8 << 56, 0: none */
 static uint32_t g_disp_modes;           /* modes set */
 
-void hle_pb_display_mode(uint32_t pitch, uint32_t xfmt, unsigned hz)
+void hle_pb_display_mode(uint32_t pitch, uint32_t xfmt, unsigned hz, uint32_t w)
 {
     __atomic_store_n(&g_disp_mode, (uint64_t)(pitch & 0xFFFFFFFFu) | (uint64_t)(xfmt & 0xFFFF) << 32 |
-                     (uint64_t)(hz & 0xFFFF) << 48, __ATOMIC_RELEASE);
+                     (uint64_t)(hz & 0xFF) << 48 | (uint64_t)((w / 8) & 0xFF) << 56, __ATOMIC_RELEASE);
     __atomic_fetch_add(&g_disp_modes, 1, __ATOMIC_RELEASE);
 }
 
-uint32_t hle_pb_display_mode_get(uint32_t *pitch, uint32_t *xfmt, unsigned *hz)
+uint32_t hle_pb_display_mode_get(uint32_t *pitch, uint32_t *xfmt, unsigned *hz, uint32_t *w)
 {
     const uint32_t n = __atomic_load_n(&g_disp_modes, __ATOMIC_ACQUIRE);
     const uint64_t m = __atomic_load_n(&g_disp_mode, __ATOMIC_ACQUIRE);
     *pitch = (uint32_t)m;
     *xfmt = (uint32_t)(m >> 32) & 0xFFFF;
-    *hz = (unsigned)(m >> 48);
+    *hz = (unsigned)(m >> 48) & 0xFF;
+    if (w) {
+        *w = (uint32_t)(m >> 56) * 8;
+    }
     return n;
 }
 
@@ -217,9 +222,20 @@ void hle_pb_overlay_changed(bool show)
     hle_pb_kick();
 }
 
+static bool flip_done(void);
+
+/* A frame waits for its flip: the decoder at a FLIP_STALL and no flip come
+ * for it yet. Not the decoder's flag alone: it holds until the decoder runs
+ * again after the flip, and the uncapped vblank thread (native/dev/nv2a.c
+ * wait_vblank), seeing the same stall still waiting a millisecond after its
+ * early vblank, took it for a presentation interval of 2 and sent another.
+ * A title with three buffers has a second frame done by then, and the
+ * vblank handler flipped it too: two frames in a millisecond. Crash
+ * Bandicoot at Up to 60 on a laptop ran at 64.5 fps (#411), at 120 here
+ * with the decoder made 1.5 ms late to go on after a flip. */
 bool hle_pb_flip_waiting(void)
 {
-    return __atomic_load_n(&g_pb.flip_wait, __ATOMIC_ACQUIRE);
+    return __atomic_load_n(&g_pb.flip_wait, __ATOMIC_ACQUIRE) && !flip_done();
 }
 
 /* FLIP_STALLs that waited: one a frame finished ahead of its flip */
@@ -970,9 +986,15 @@ static bool dma_object(uint32_t *base, uint32_t *limit, uint32_t *inst)
  * alike. The grid starts over after a long stop (a load). */
 #define PACE_RESTART 8
 
+/* A title that flips in a trap's handler flips a frame now and then outside
+ * one, in its vblank handler or its own code: that flip takes its slot too.
+ * Passed over, the frame after it went on at once and its trap's flip fell
+ * in the same slot: Republic Commando at Up to 60 ran at 60.6 to 61.4 fps,
+ * about one such flip a second, 1 to 2.5 ms past its slot (60.0 now). */
 static void pace_flip(void)
 {
     const int64_t every = hle_host_flip_min_ns(), now = hle_now_ns();
+    g_pb.pace_flips = __atomic_load_n(&g_fl_flips, __ATOMIC_ACQUIRE);
     if (every <= 0) {
         g_pb.pace_slot = 0;
         return;
@@ -1034,7 +1056,10 @@ static void consume_pass(void)
         hle_host_gpu_trace(HLE_GTR_RESUME, 1);
         if (__atomic_load_n(&g_fl_flips, __ATOMIC_ACQUIRE) != g_pb.trap_flips) {
             pace_flip();                            /* its handler flipped */
+            __atomic_store_n(&g_trap_flip_ns, hle_now_ns(), __ATOMIC_RELAXED);
         }
+    } else if (__atomic_load_n(&g_fl_flips, __ATOMIC_ACQUIRE) != g_pb.pace_flips && hle_pb_flips_in_traps()) {
+        pace_flip();                                /* a flip outside a trap (pace_flip) */
     }
     if (!fifo_open()) {
         hle_pbd_keep_stalled();
@@ -1496,6 +1521,196 @@ static struct {
  * start (the last frame end or a flip since, whichever came later) */
 static int64_t g_fl_flip_ns, g_fl_every_ns, g_fl_end_ns, g_fl_work_ns;
 
+/*
+ * What a hold costs the display. The hold is for a CPU much quicker than
+ * the display (the quick test, hle_pb_pushed), and costs nothing there: the
+ * frame begun at the flip is ready in time for its own. The quick test,
+ * though, is against the time between flips, which a hold that costs the
+ * display stretches itself, and it then keeps holding. Each frame begun
+ * after a hold is judged as it is shown (hle_pb_frame_shown), in steps of the
+ * game's pace (a vblank, or the limit's), against the game's own time
+ * between flips: the steps a frame that waited ready for its flip took (a
+ * presentation interval of 2: two), else one. Holds begin only once
+ * FL_OWN_ROW frames in a row waited the same steps (held from a savestate's
+ * first frames, Vice City at Original read as one step, its two as slowing
+ * down, and lost the hold).
+ *
+ * Held, each frame begins at a flip, so the time the game reads between its
+ * frames is the time between its flips: one step apart, a console's own
+ * rhythm, the least there is. Further apart it is the time the game chose,
+ * never less, and a title that sets its presentation interval by that time
+ * never sees room to go back, only to go up. Crazy Taxi 3 went in on a
+ * loading screen (frames of 0.3 ms, flips 2 steps apart) and played held,
+ * its frames ready and waiting 3 and 4 steps: 20 and 15 fps until the game
+ * was closed (#407). (Unheld it picks 30 at times by itself, its CPU idle
+ * and 3 frames queued, D3D's most: the game's own choice, not the hold's.)
+ * The steps alone can't tell it from a title that needs the hold there:
+ * Vice City at Original, 2 steps apart too, is the one the hold was made for
+ * (5326e7103a). What the game does once held can, three ways a hold costs:
+ *
+ * The game slows down held: three of the last 8 held frames that waited
+ * ready for more steps than the game's own when the hold went in, and there
+ * are no more holds until the push buffer's count syncs again (another
+ * stream, after a load). Crazy Taxi 3 so: off within its first holds into
+ * play (waited 3 steps, its own 2), and it goes on as unheld.
+ *
+ * Or held, a CPU and a GPU that worked side by side take turns: the GPU
+ * finishes the frame it has while the CPU waits, then waits itself for the
+ * CPU's next, and when the two no longer fit in the game's time, frames
+ * begun after a hold come a step or more late: suspect when one came later
+ * than the game's own time, the moment it was ready (not waiting ready), and
+ * late by no more than the hold lasted (later, the frame took that long by
+ * itself: a hitch, a load, not the hold). Three suspects in the last 8 held
+ * frames and the hold is left off for FL_PROBE frames, timed too: when they
+ * come half a step sooner than the suspects or more, the hold costs the
+ * display and stays off until a resync; else their time is the game's own,
+ * and the hold goes on.
+ *
+ * Or the flip waited for comes only once the hold ends (the game's thread,
+ * held right after its push, would do its own part of the flip after it):
+ * each hold runs to its longest, 50 ms. FL_TIMEOUTS holds in a row that end
+ * so, and no more holds until a resync. On time a hold ends at the game's
+ * next flip, never its longest.
+ */
+#define FL_RING 32
+#define FL_PROBE 12
+#define FL_PROBE_SKIP 3                 /* shown first in a probe: begun before it */
+#define FL_HOLD_MAX 50000000ll          /* a hold's longest (the kernel's FRAME_HOLD_MAX_NS) */
+#define FL_TIMEOUTS 2
+#define FL_HOLDS_APART 1000000000ll     /* holds this far apart: they go in anew */
+#define FL_OWN_ROW 4                    /* frames in a row that waited the same steps: the game's own */
+#define FL_GAP_MAX 250000000ll          /* flips further apart: a pause or a load, not judged */
+static struct {
+    int64_t req_ns;                     /* a hold asked for, its flip not yet come (fl_hold) */
+    uint32_t req_frame;                 /* ... the frame begun after it */
+    int64_t held_ns[FL_RING];           /* frames begun after a hold: how long it held */
+    uint32_t held_frame[FL_RING];
+    int64_t last_ns, step_ns;           /* the last frame shown; the pace's step */
+    int own;                            /* the game's own steps between flips (0: one) */
+    int own_row;                        /* ... the last frames that waited it, in a row */
+    bool own_known;                     /* FL_OWN_ROW so: holds may begin */
+    int own_in;                         /* ... as the holds went in (fl_hold) */
+    int64_t hold_ns;                    /* the last hold asked for */
+    uint8_t slow;                       /* the last 8 held frames shown: waited past own_in */
+    uint8_t hist;                       /* ... suspect (bit 0 the last) */
+    int susp_steps, susp_n;             /* the suspects' steps */
+    int probe;                          /* frames to show yet in a probe (no holds) */
+    int probe_steps, probe_n;
+    bool off;                           /* the hold costs the display: none till a resync */
+    uint32_t timeouts;                  /* the kernel's holds ended at their longest, as last seen */
+    int timeouts_row;                   /* ... the last holds' in a row */
+    unsigned logged;
+} g_flc;
+
+static void fl_cost_reset(void)
+{
+    const unsigned logged = g_flc.logged;
+    memset(&g_flc, 0, sizeof(g_flc));
+    g_flc.logged = logged;
+    g_flc.timeouts = hle_host_frame_holds_timed_out();
+}
+
+static int fl_own(void)
+{
+    return g_flc.own > 0 ? g_flc.own : 1;
+}
+
+void hle_pb_frame_shown(uint32_t frame, int64_t swap_ns)
+{
+    const int64_t now = hle_now_ns(), step = hle_host_flip_min_ns();
+    if (g_flc.req_ns) {
+        /* the flip that ends the hold asked for (or after its longest) */
+        const int64_t h = now - g_flc.req_ns;
+        g_flc.held_ns[g_flc.req_frame % FL_RING] = h < FL_HOLD_MAX ? h : FL_HOLD_MAX;
+        g_flc.held_frame[g_flc.req_frame % FL_RING] = g_flc.req_frame;
+        g_flc.req_ns = 0;
+    }
+    const uint32_t slot = frame % FL_RING;
+    const int64_t held = g_flc.held_frame[slot] == frame ? g_flc.held_ns[slot] : 0;
+    g_flc.held_frame[slot] = 0;
+    const int64_t last = g_flc.last_ns;
+    g_flc.last_ns = now;
+    if (step != g_flc.step_ns) {
+        /* another pace (the frame rate setting, fast forward): judged afresh */
+        const int64_t req = g_flc.req_ns;
+        const uint32_t req_frame = g_flc.req_frame;
+        fl_cost_reset();
+        g_flc.step_ns = step;
+        g_flc.last_ns = now;
+        g_flc.req_ns = req;
+        g_flc.req_frame = req_frame;
+        return;
+    }
+    if (step <= 0) {
+        g_flc.own_known = true;             /* no pace (Unlocked): no steps to judge by */
+        return;
+    }
+    if (!last || now - last > FL_GAP_MAX) {
+        return;                             /* a pause, a load */
+    }
+    const int64_t d = now - last;
+    const int steps = (int)((d + step / 2) / step);
+    const bool waited = swap_ns && now - swap_ns >= step * 3 / 4;
+    if (waited && steps >= 1 && steps <= 4) {
+        g_flc.own_row = steps == g_flc.own ? g_flc.own_row + 1 : 1;
+        g_flc.own = steps;                  /* ready, it waited for the game's own time */
+        g_flc.own_known |= g_flc.own_row >= FL_OWN_ROW;
+    } else if (steps >= 1 && steps < fl_own()) {
+        g_flc.own = steps;
+    }
+    if (g_flc.probe) {
+        if (g_flc.probe <= FL_PROBE - FL_PROBE_SKIP) {
+            g_flc.probe_steps += steps;
+            g_flc.probe_n++;
+        }
+        if (--g_flc.probe) {
+            return;
+        }
+        /* unheld half a step sooner or more: the hold cost the display */
+        const int sn = g_flc.susp_n, ss = g_flc.susp_steps, pn = g_flc.probe_n, ps = g_flc.probe_steps;
+        const bool cost = sn && pn && 2 * ps * sn <= (2 * ss - sn) * pn;
+        if (cost) {
+            g_flc.off = true;
+        } else if (sn) {
+            g_flc.own = (2 * ss + sn) / (2 * sn);       /* the game's own time, held or not */
+        }
+        if (g_flc.logged++ < 16) {
+            hle_log("xbased-hle-pb", "frame latency hold: frames %.1f steps apart held, %.1f without it: %s "
+                    "(steps of %.1f ms)", sn ? (double)ss / sn : 0.0, pn ? (double)ps / pn : 0.0,
+                    cost ? "no more holds till the push buffer syncs again" : "the game's own, holds go on",
+                    step / 1e6);
+        }
+        g_flc.hist = 0;
+        g_flc.susp_steps = g_flc.susp_n = g_flc.probe_steps = g_flc.probe_n = 0;
+        return;
+    }
+    if (!held || g_flc.off) {
+        return;
+    }
+    /* waited ready for more steps than the game's own as the holds went in:
+     * the hold slows the game down */
+    g_flc.slow = (uint8_t)(g_flc.slow << 1 | (waited && g_flc.own_in && steps > g_flc.own_in));
+    if (__builtin_popcount(g_flc.slow) >= 3) {
+        g_flc.off = true;
+        if (g_flc.logged++ < 16) {
+            hle_log("xbased-hle-pb", "frame latency hold: held frames waited %d steps for their flips, the game's "
+                    "own %d as the hold went in: the game slows down held, no more holds till the push buffer "
+                    "syncs again (steps of %.1f ms)", steps, g_flc.own_in, step / 1e6);
+        }
+        return;
+    }
+    const bool suspect = !waited && steps > fl_own() && d - (int64_t)fl_own() * step <= held + step / 2;
+    g_flc.hist = (uint8_t)(g_flc.hist << 1 | suspect);
+    if (suspect) {
+        g_flc.susp_steps += steps;
+        g_flc.susp_n++;
+    }
+    if (__builtin_popcount(g_flc.hist) >= 3) {
+        g_flc.probe = FL_PROBE;             /* the next frames unheld, to compare */
+        g_flc.probe_steps = g_flc.probe_n = 0;
+    }
+}
+
 void hle_pb_flip_read(void)
 {
     __atomic_add_fetch(&g_fl_flips, 1, __ATOMIC_RELEASE);
@@ -1579,16 +1794,18 @@ static void fl_scan(uint32_t put)
         return;
     }
     if (!g_fl.synced) {
-        if (!hle_pb_flip_waiting()) {
+        /* the decoder at the stall (its GET there), its flip come or not */
+        if (!__atomic_load_n(&g_pb.flip_wait, __ATOMIC_ACQUIRE)) {
             return;
         }
         uint32_t pos = hle_host_gpu_reg(NV_PFIFO_CACHE1_DMA_GET), ends = hle_pbd_frames_swapped();
-        if (!hle_pb_flip_waiting() || !fl_count(base, limit, &pos, put, &ends)) {
+        if (!__atomic_load_n(&g_pb.flip_wait, __ATOMIC_ACQUIRE) || !fl_count(base, limit, &pos, put, &ends)) {
             return;
         }
         g_fl.pos = pos;
         g_fl.ends = ends;
         g_fl.synced = true;
+        fl_cost_reset();                        /* another stream: the hold judged afresh */
         return;
     }
     if (!fl_count(base, limit, &g_fl.pos, put, &g_fl.ends)) {
@@ -1626,7 +1843,8 @@ void hle_pb_pushed(uint32_t put)
      * held one frame and not the next, its clock read at the flip or right
      * after the frame before (4 then 29 ms: driving fast, the city moved
      * 4 ms in one picture and 29 in the next, 235 times in 31 s); held or
-     * not throughout, every read is 16 to 17 ms after the last. */
+     * not throughout, every read is 16 to 17 ms after the last. (What the
+     * hold costs the display, whatever these say: hle_pb_frame_shown.) */
     bool quick = false;
     if (ended) {
         const int64_t now = hle_now_ns(), flip = __atomic_load_n(&g_fl_flip_ns, __ATOMIC_ACQUIRE);
@@ -1640,14 +1858,36 @@ void hle_pb_pushed(uint32_t put)
         g_fl.quick = every && g_fl_work_ns * (g_fl.quick ? 2 : 4) < every;
         quick = g_fl.quick;
     }
-    g_fl.hold = ended && g_fl.synced && waiting >= 2 && waiting <= 6 && gpu_caught_up && quick;
+    g_fl.hold = ended && g_fl.synced && waiting >= 2 && waiting <= 6 && gpu_caught_up && quick &&
+                g_flc.own_known && !g_flc.off && !g_flc.probe;
 }
 
 static void fl_hold(void)
 {
     if (g_fl.hold) {
         g_fl.hold = false;
+        /* the last hold (its thread runs again: this one): ended at its
+         * longest, no flip come */
+        const uint32_t to = hle_host_frame_holds_timed_out();
+        g_flc.timeouts_row = to != g_flc.timeouts ? g_flc.timeouts_row + 1 : 0;
+        g_flc.timeouts = to;
+        if (g_flc.timeouts_row >= FL_TIMEOUTS) {
+            g_flc.off = true;
+            if (g_flc.logged++ < 16) {
+                hle_log("xbased-hle-pb", "frame latency hold: %d holds in a row ended at %d ms, the flip not "
+                        "come (the title's thread does its part): no more holds till the push buffer syncs "
+                        "again", g_flc.timeouts_row, (int)(FL_HOLD_MAX / 1000000));
+            }
+            return;
+        }
         g_fl.holds++;
+        const int64_t now = hle_now_ns();
+        if (!g_flc.hold_ns || now - g_flc.hold_ns > FL_HOLDS_APART) {
+            g_flc.own_in = fl_own();             /* the holds go in: the game's own time then */
+        }
+        g_flc.hold_ns = now;
+        g_flc.req_ns = now;
+        g_flc.req_frame = g_fl.ends + 1u;     /* the frame begun once it ends */
         hle_host_frame_wait();
     }
 }
@@ -1799,6 +2039,12 @@ bool hle_pb_park(bool at_flip, uint64_t timeout_ns)
         g_usleep(1000);
     }
     return true;
+}
+
+bool hle_pb_flips_in_traps(void)
+{
+    const int64_t t = __atomic_load_n(&g_trap_flip_ns, __ATOMIC_RELAXED);
+    return t && hle_now_ns() - t < 1000000000;
 }
 
 void hle_pb_unpark(void)

@@ -88,7 +88,7 @@ static uint32_t surf_scale(const HleSurfDesc *d, VkImageAspectFlags aspect)
      * of the image, its pond a grid of squares) */
     bool small = !d->role && !d->pitch && !d->parent && d->faces <= 1 &&
                  MAX(d->w, d->h) <= SURF_UNSCALED_MAX;
-    if (small) {
+    if (small || d->native) {
         return 1;
     }
     /* A linear colour target of half a frame or less (a glow or blur
@@ -272,7 +272,7 @@ HleVkSurf *hle_surf_define(const HleSurfDesc *d)
     HleVkSurf *s = hle_surf_get(d->id);
     if (s && s->d.xfmt == d->xfmt && s->d.w == d->w && s->d.h == d->h &&
         s->d.parent == d->parent && s->d.levels == d->levels && s->d.faces == d->faces &&
-        s->d.level == d->level && s->d.face == d->face) {
+        s->d.level == d->level && s->d.face == d->face && s->d.native == d->native) {
         /* Same image identity. pa/pitch are READBACK metadata (Swap's Data
          * rotation and header re-resolution change them every frame), and the
          * role set by DEVICE_CREATE survives an OBJ_CREATE with role 0. */

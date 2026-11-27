@@ -11,10 +11,12 @@ option) any later version. See `COPYING`.
 | [hakuX](https://github.com/rfandango/hakuX) | fork of xemu for Android | GPL-3.0-or-later |
 | [xbased](https://github.com/crazyriddler/xbased) | started from hakuX; the reference this core was written from | GPL-3.0-or-later |
 
-xbemu is a derived work of xbased 1.2.5. The Rust code in `crates/` and
-`apps/` was written from it: much of the kernel, the devices, the disc
-formats and the memory model follow its design, and it remains the reference
-the core is checked against. That is why xbemu is, and has to be,
+xbemu is a derived work of xbased. The Rust code in `crates/` and `apps/`
+was written from xbased 1.2.5, with fixes of its releases up to 1.2.16
+ported since: much of the kernel, the devices, the disc formats and the
+memory model follow its design, and it remains the reference the core is
+checked against. The vendored renderer and audio processor are xbased
+1.2.12's files (each directory's README names the commit). That is why xbemu is, and has to be,
 GPL-3.0-or-later. The aim is a core in pure Rust; the vendored code below is
 what has not been rewritten yet.
 

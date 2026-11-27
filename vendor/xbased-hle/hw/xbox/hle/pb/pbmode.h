@@ -31,6 +31,10 @@ void hle_pb_put(void);
 /* pbdraw.c: a frame swapped went to the display (its flip), for the frame
  * latency (pbmode.c fl_hold). Any thread. */
 void hle_pb_frame_flipped(void);
+/* pbdraw.c, at a flip of the guest's (its vblank ISR's, the vCPU thread):
+ * frame (the frames swapped counting it) shown, swapped (its
+ * FLIP_INCREMENT_WRITE decoded) at swap_ns: what a hold cost (pbmode.c) */
+void hle_pb_frame_shown(uint32_t frame, int64_t swap_ns);
 /* The guest is writing DMA_PUT = put (its vCPU thread), before the register
  * holds it: the report scout reads what it pushed (mem/barrier.h
  * hle_barrier_report_pushed) before the decoder can. */
@@ -42,11 +46,12 @@ void hle_pb_get(void);
  * thread; the decode thread presents it). */
 void hle_pb_display_start(uint32_t pa);
 /* AvSetDisplayMode (any thread): its frame buffer's pitch and format, the
- * mode's refresh (50 or 60 Hz); the decoder's display takes its size from
- * them (hle_pb_display_mode_get: 0s while none was set; its return value
- * counts the modes set). */
-void hle_pb_display_mode(uint32_t pitch, uint32_t xfmt, unsigned hz);
-uint32_t hle_pb_display_mode_get(uint32_t *pitch, uint32_t *xfmt, unsigned *hz);
+ * mode's refresh (50 or 60 Hz) and width when its timing tells it (0: by the
+ * pitch); the decoder's display takes its size from them
+ * (hle_pb_display_mode_get: 0s while none was set; its return value counts
+ * the modes set). */
+void hle_pb_display_mode(uint32_t pitch, uint32_t xfmt, unsigned hz, uint32_t w);
+uint32_t hle_pb_display_mode_get(uint32_t *pitch, uint32_t *xfmt, unsigned *hz, uint32_t *w);
 /* AvSetDisplayMode (any thread), after hle_pb_display_mode: the frame buffer
  * the display scans out; one a title draws with the CPU, having no GPU
  * device, is shown (hle_pbd_cpu_display). */

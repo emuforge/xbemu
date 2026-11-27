@@ -1,11 +1,12 @@
 # vendor/xbased-hle: the GPU renderer
 
-The NV2A push-buffer renderer of **xbased 1.2.5**, vendored for `crates/xb-gpu`.
+The NV2A push-buffer renderer of **xbased 1.2.12**, with one later fix,
+vendored for `crates/xb-gpu`.
 
 | | |
 |---|---|
 | Upstream | https://github.com/crazyriddler/xbased |
-| Version | xbased 1.2.5, commit `2031611e0aebed3c3852af16a63108cabd9554a0` |
+| Version | xbased 1.2.12, commit `577f3b8841e166177c613356050f94980622d579`: the files here are that commit's. `hw/xbox/hle/pb/pbdraw.c` also has the change xbased 1.2.16 (commit `5586567b70ffda0df156f509ee496c72140dfa9b`) makes to `target_part` (Alter Echo's intro movie), and nothing else of the releases after 1.2.12. |
 | License | GPL-3.0-or-later (`COPYING`, `LICENSE`); xbased derives from hakuX and xemu |
 
 It decodes the push buffer a title's Direct3D sends to the NV2A and draws
@@ -17,7 +18,7 @@ implements in Rust (`src/ffi.rs`).
 
 | Path | From xbased | Notes |
 |---|---|---|
-| `hw/xbox/hle/` | `hw/xbox/hle/` | the renderer, 106 files. The files `PATCHES.md` names are patched; the rest are byte-identical. The two empty packaging scripts (`package_linux.sh`, `package_windows.ps1`, 0 bytes each) were not copied. |
+| `hw/xbox/hle/` | `hw/xbox/hle/` | the renderer, 106 files. The files `PATCHES.md` names are patched; the rest are byte-identical to xbased 1.2.12's. The two empty packaging scripts (`package_linux.sh`, `package_windows.ps1`, 0 bytes each) were not copied. |
 | `native/compat/glib/` | `native/compat/glib/` | xbased's own GLib subset (`glib.h`, `glib.c`) the renderer is written against. Unmodified. |
 | `native/state/` | `native/state/` | `def.h`, `state.h`, `lock.h`, `sections.h`, `pbd.def`: the description of the decoder's savestate section that `pb/pbstate.c` is built against. Unmodified. |
 | `shim/` | written for xbemu | `include/native/core/nc.h` and `state_rec.c`: what the savestate section needs of xbased's core (`PATCHES.md` 7). |
@@ -65,7 +66,13 @@ Zydis definitions and include paths, and `-flto=thin`.
 
 Copy the new `hw/xbox/hle` and `native/state` over these, re-apply
 `PATCHES.md` (which says which changes are guarded by `XBEMU_HOST`), update
-the commit above, and check `host.h` for new or changed functions against
-`crates/xb-gpu/src/ffi.rs`.
+the commit above, and check `host.h`, `pb/pbmode.h` and `vk/swapchain.h` for
+new or changed functions against `crates/xb-gpu/src/ffi.rs`: the Rust
+declarations are written by hand, and a changed parameter list still links.
 `diff -ru <xbased>/hw/xbox/hle vendor/xbased-hle/hw/xbox/hle` must show only
-the patches.
+the patches (and, against 1.2.12, the one later fix named above).
+
+Entry points of the renderer that xbemu does not call: `hle_present_set_ff`
+(the fast-forward sign), `hle_pb_flips_in_traps` (xbemu parks the decoder
+where it is for a savestate, never at a flip) and `hle_present_end`'s
+downsampling, which is passed 0 (off).

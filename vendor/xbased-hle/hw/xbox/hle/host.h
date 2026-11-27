@@ -109,6 +109,8 @@ uint64_t hle_host_flip_vblank_ns(void);
  * vCPU thread, in its DMA_PUT); and a flip came (any thread). */
 void hle_host_frame_wait(void);
 void hle_host_frame_flipped(void);
+/* the holds so far that ended at their longest, no flip come */
+uint32_t hle_host_frame_holds_timed_out(void);
 /* The least time between two flips a trap's handler does (D3D's IMMEDIATE
  * presents: the guest waits for no vblank), as the options have it: the
  * console's vblank at the original frame rate, the limit when it is lifted,

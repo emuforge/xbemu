@@ -1251,6 +1251,13 @@ static bool is_colour_rt(uint32_t rt_id)
     return rt && (rt->aspect & VK_IMAGE_ASPECT_COLOR_BIT);
 }
 
+/* A colour target a copy before the draw can stand for (hle_draw_snap): its
+ * own image, not another's view nor one sampled in place (general). */
+static bool snap_ok(const HleVkSurf *rt)
+{
+    return rt && rt->img && !rt->general && !rt->d.parent && (rt->aspect & VK_IMAGE_ASPECT_COLOR_BIT);
+}
+
 /* A linear stage whose own size (its IMAGE_RECT) is less than the target's
  * on an axis: the target's top-left part, read at the stage's texel
  * coordinates, not at the fragment's own pixel, so not by fbfetch (the copy
@@ -1268,27 +1275,47 @@ static bool part_of_target(const HleCmdDraw *c, unsigned st, uint32_t rt_id)
 }
 
 /*
- * Fixed-function stages (the key's: from the cascade's first) whose texture
- * is the colour target the draw renders: they read its pixel (fbfetch), as
- * the NV2A's texture unit reads the memory being rendered. Splinter Cell's
- * Palm draws its persistence quad last, the front buffer as its texture at
- * a fixed address, which on every other frame is the back buffer it draws
- * into; refused as a texture, it sampled white, a white flash fading with
- * the effect's alpha after each move in the menus.
+ * Stages whose texture is the colour target the draw renders read it where
+ * their coordinates say, as the NV2A's texture unit reads the memory being
+ * rendered: from a copy of it made just before the draw (hle_draw_snap).
+ * Splinter Cell's Palm draws its persistence quad last, the front buffer as
+ * its texture at a fixed address, which on every other frame is the back
+ * buffer it draws into; refused as a texture, it sampled white, a white flash
+ * fading with the effect's alpha after each move in the menus. Read at the
+ * fragment's own pixel instead (fbfetch), as they were, a stage reading the
+ * target shifted drew the picture over itself unchanged: Grand Theft Auto
+ * III's raindrops on the lens, each the screen behind it seen through a
+ * drop, were not to be seen (#389). fbfetch is left for a target no copy
+ * stands for (another surface's view).
+ *
+ * Fixed-function stages that sample the target (from the cascade's first):
+ * any (ff_samples_rt); for fbfetch, by the key's bits (ff_fb_stages).
  */
-static unsigned ff_fb_stages(const HleCmdDraw *c, uint32_t rt_id)
+static bool ff_samples_rt(const HleCmdDraw *c, uint32_t rt_id)
 {
     const HleCmdState *s = &g_dr.st;
-    if (!g_hvk.caps.fbfetch || !rt_id || !g_dr.st_valid || s->psh) {
+    unsigned first = s->rs[RS_POINTSPRITEENABLE] ? HLE_FF_SPRITE_STAGE : 0;
+    for (unsigned st = first; st < HLE_FF_STAGES && s->tss[st][TSS_COLOROP] > 1; st++) {
+        if (c->tex[st] == rt_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static unsigned ff_fb_stages(const HleCmdDraw *c, uint32_t rt_id)
+{
+    if (!g_hvk.caps.fbfetch || !rt_id || !g_dr.st_valid || g_dr.st.psh) {
         return 0;
     }
+    const HleCmdState *s = &g_dr.st;
     unsigned first = s->rs[RS_POINTSPRITEENABLE] ? HLE_FF_SPRITE_STAGE : 0, m = 0;
     for (unsigned st = first; st < HLE_FF_STAGES && s->tss[st][TSS_COLOROP] > 1; st++) {
         if (c->tex[st] == rt_id && !part_of_target(c, st, rt_id)) {
             m |= 1u << (st - first);
         }
     }
-    return m && !tex_find(rt_id) && is_colour_rt(rt_id) ? m : 0;
+    return m && !tex_find(rt_id) && is_colour_rt(rt_id) && !snap_ok(hle_surf_get(rt_id)) ? m : 0;
 }
 
 /* Several times a draw: the target is looked up only when a stage samples it. */
@@ -1311,7 +1338,8 @@ unsigned hle_draw_fb_stages(const HleCmdDraw *c, uint32_t rt_id)
             m |= 1u << st;
         }
     }
-    return m && is_colour_rt(rt_id) ? m : 0;
+    /* (the copy where one stands for the target: ff_fb_stages) */
+    return m && is_colour_rt(rt_id) && (tex_find(rt_id) || !snap_ok(hle_surf_get(rt_id))) ? m : 0;
 }
 
 bool g_hle_fbbar_off;
@@ -1536,8 +1564,13 @@ static bool samples(unsigned mode)
 
 bool hle_draw_snap_needed(const HleCmdDraw *c, uint32_t rt_id)
 {
-    if (!rt_id || !g_dr.st_valid || !g_dr.st.psh) {
+    if (!rt_id || !g_dr.st_valid) {
         return false;
+    }
+    if (!g_dr.st.psh) {
+        /* fixed-function stages too (ff_fb_stages claims none where a copy
+         * stands for the target) */
+        return ff_samples_rt(c, rt_id) && !tex_find(rt_id) && snap_ok(hle_surf_get(rt_id));
     }
     unsigned m = 0;
     for (unsigned st = 0; st < HLE_TSS_STAGES; st++) {
@@ -1547,8 +1580,7 @@ bool hle_draw_snap_needed(const HleCmdDraw *c, uint32_t rt_id)
         }
     }
     HleVkSurf *rt = m && !tex_find(rt_id) ? hle_surf_get(rt_id) : NULL;
-    if (!rt || !rt->img || rt->general || rt->d.parent ||
-        !(rt->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
+    if (!snap_ok(rt)) {
         return false;
     }
     return (m & ~hle_draw_fb_stages(c, rt_id)) != 0;

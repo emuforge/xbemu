@@ -2,7 +2,7 @@
 
 ## Files from xbased (`native/`)
 
-Three files under `native/dev/apu` differ from xbased 1.2.5: `apu.c`,
+Three files under `native/dev/apu` differ from xbased 1.2.12: `apu.c`,
 `dsp/dsp_rec.cpp` and `dsp/gp_ep.c`, by the numbered changes below and the
 changes under "Changes for speed". The changes are marked `xbemu:` in the
 source. Every other file there, and `native/cpu/x64asm.h`, is identical.
@@ -44,7 +44,7 @@ Everything else xbemu needs differently is done outside those files:
 | `state.c` (savestates) includes xbased's `native/state` headers | `shim/include/native/state/{state.h,def.h,sections.h}` declare the byte buffer and the one record it uses; `shim/apu_shim.c` implements them and hands the state to Rust as bytes (`xb_apu_shim_state_save`, `_load`, `_free`). `state.c` itself is compiled as it is. Its buffer and record functions and its two entry points are renamed at compile time (`build.rs` `RENAMES`), as the renderer has the reference's own under the same names. |
 | The frame thread must not run before `Apu::start`, and must stop for a pause | It already parks in `nc_pause_wait` while `nc_paused()`; Rust implements both. |
 | `gp_ep.c` remembers the last output preference in a function static, so a second device in one process could skip applying it | `ffi.rs` applies the opposite preference and then the wanted one after init. |
-| The recompiler does not exist off x86-64 (xbased 1.2.5 itself builds for x86-64 only) | `dsp_rec.cpp`, Zydis and the x86 flags (`-msse4.1 -mpopcnt`) are left out there (`build.rs`, by target arch) and `ffi.rs` defines `dsp_rec_run` and friends to say "not available", which sends `dsp_run` to the interpreter. That is hakuX's arm64 build: the interpreter alone (`dsp_cpu.c`, no recompiler, no Zydis) and no architecture flags. |
+| The recompiler does not exist off x86-64 (xbased itself builds for x86-64 only) | `dsp_rec.cpp`, Zydis and the x86 flags (`-msse4.1 -mpopcnt`) are left out there (`build.rs`, by target arch) and `ffi.rs` defines `dsp_rec_run` and friends to say "not available", which sends `dsp_run` to the interpreter. That is hakuX's arm64 build: the interpreter alone (`dsp_cpu.c`, no recompiler, no Zydis) and no architecture flags. |
 
 Build flags that differ from the reference's `xbased_apu` target: no
 `-flto=thin` (the objects go into a Rust static library), no `-g1`, and the

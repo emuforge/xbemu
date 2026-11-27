@@ -616,6 +616,7 @@ fn a_thread_asked_to_hold_waits_for_the_next_flip_with_its_registers_as_they_wer
     assert!(waited < Duration::from_millis(45), "the flip ended it, not the deadline ({waited:?})");
     assert_eq!(t.k.current, Some(main));
     assert_eq!((t.k.eip(), t.k.esp(), t.k.frame.regs.gpr[reg::EAX]), before);
+    assert_eq!(hold.timed_out(), 0, "a hold a flip ended did not time out");
     assert!(!hold.flipped(), "nothing is held now");
 }
 
@@ -643,11 +644,13 @@ fn a_hold_ends_at_its_deadline_when_no_flip_comes() {
     let mut t = testing::kernel();
     t.start_clock();
     let main = t.k.current.unwrap();
-    t.k.frame_hold().request();
+    let hold = t.k.frame_hold();
+    hold.request();
     let t0 = std::time::Instant::now();
     t.entry(Exit::Kicked);
     let waited = t0.elapsed();
     assert_eq!(t.k.stats.frame_holds, 1);
+    assert_eq!(hold.timed_out(), 1, "the renderer is told of a hold no flip ended");
     assert_eq!(t.k.current, Some(main));
     assert!(
         waited >= Duration::from_millis(45) && waited < Duration::from_millis(200),

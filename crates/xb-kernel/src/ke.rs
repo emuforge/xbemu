@@ -269,10 +269,11 @@ impl Kernel {
                 // A frame-latency hold: until a flip, or its deadline; the
                 // thread was between two instructions, its registers stay.
                 let d = self.threads[i].wait.deadline.unwrap_or(now);
-                if self.flip_hold.flips() != seq || now >= d {
+                let flipped = self.flip_hold.flips() != seq;
+                if flipped || now >= d {
                     self.threads[i].wait = Wait::default();
                     self.threads[i].state = ThreadState::Ready;
-                    self.frame_hold_ended();
+                    self.frame_hold_ended(!flipped);
                 } else {
                     earliest = Some(earliest.map_or(d, |e| e.min(d)));
                 }

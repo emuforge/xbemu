@@ -547,6 +547,10 @@ impl GpuHost for Shared {
         }
     }
 
+    fn frame_holds_timed_out(&self) -> u32 {
+        self.frame.timed_out()
+    }
+
     fn cpu_regs(&self) -> Option<CpuRegs> {
         if !self.cpu.ran.load(Ordering::Relaxed) {
             return None;

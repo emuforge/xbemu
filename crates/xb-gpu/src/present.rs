@@ -18,7 +18,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use xb_types::settings::Aspect;
 
-use crate::ffi::{self, HLE_OV_BLEND, HLE_UPSCALE_BILINEAR, HleOvCmd, HleOvVert, Shared};
+use crate::ffi::{
+    self, DOWNSAMPLE_OFF, HLE_OV_BLEND, HLE_UPSCALE_BILINEAR, HleOvCmd, HleOvVert, Shared,
+};
 use crate::nv2a::lock;
 use crate::os;
 
@@ -450,7 +452,7 @@ pub(crate) fn present(s: &'static Shared, width: u32, height: u32) -> bool {
     unsafe {
         ffi::hle_present_set_clip(1.0, 1.0);
         ffi::hle_present_set_osd(osd);
-        ffi::hle_present_end(sx, sy, fxaa, HLE_UPSCALE_BILINEAR, true, key);
+        ffi::hle_present_end(sx, sy, fxaa, HLE_UPSCALE_BILINEAR, true, DOWNSAMPLE_OFF, key);
     }
     true
 }

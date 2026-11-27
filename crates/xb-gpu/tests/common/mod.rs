@@ -96,6 +96,9 @@ impl GpuHost for MockHost {
     fn guest_hold(&self, _on: bool) {}
     fn frame_wait(&self) {}
     fn frame_flipped(&self) {}
+    fn frame_holds_timed_out(&self) -> u32 {
+        0
+    }
     fn cpu_regs(&self) -> Option<CpuRegs> {
         Some(CpuRegs { eip: 0x0001_1000, eflags: 0x202, ..CpuRegs::default() })
     }

@@ -16,7 +16,11 @@
  *  - a smaller one is scaled up bilinearly, or by AMD FidelityFX Super
  *    Resolution 1: EASU rebuilds its edges into an image of ours at the
  *    size it takes in the window, once a frame, and RCAS sharpens that on
- *    its way into the window.
+ *    its way into the window;
+ *  - downsampling (hle_present_end's down): a frame at a render scale above
+ *    it averaged first into an image of ours at the console's resolution
+ *    times it (1, 2 or 4), once a frame, which then takes the frame's place
+ *    on the way above: the scale's edges, the console's pixels.
  * FXAA is FXAA 3.11 Quality (Timothy Lottes) as PCSX2's fxaa.fx tunes it
  * (GPL-3.0-or-later); FSR 1 is AMD's ffx_fsr1.h (MIT,
  * licenses/amd-fsr1.license.txt).
@@ -58,11 +62,11 @@
 
 #define T (g_ps.t)
 #define PS_FRAMES 3             /* the presenter's submits in flight */
-enum { SET_WINDOW, SET_FXAA, SET_EASU, SET_OSD, PS_SETS };  /* a frame's descriptor sets */
+enum { SET_WINDOW, SET_FXAA, SET_EASU, SET_OSD, SET_DOWN, PS_SETS };  /* a frame's descriptor sets */
 #define PS_RAMP 1024            /* a frame's share of the ramp buffer (768 used) */
 
 /* the window's pipelines, then those into images of ours (R8G8B8A8) */
-enum { P_BILINEAR, P_AREA, P_RCAS, P_CRT, P_OSD, P_KDOWN, P_KUP, P_FXAA, P_EASU, P_COUNT };
+enum { P_BILINEAR, P_AREA, P_RCAS, P_CRT, P_OSD, P_KDOWN, P_KUP, P_FXAA, P_EASU, P_DOWN, P_COUNT };
 
 /* An image of ours a pass draws into and the window's pass samples. */
 typedef struct PsImg {
@@ -72,7 +76,8 @@ typedef struct PsImg {
     uint32_t w, h;
     VkFormat fmt;
     uint64_t serial;            /* the frame it holds (0: none) */
-    bool fxaa;                  /* FSR's: made from FXAA's */
+    bool fxaa;                  /* FSR's, downsampling's: made from FXAA's */
+    bool down;                  /* FSR's: made from downsampling's */
 } PsImg;
 
 typedef struct PsFrame {
@@ -132,8 +137,9 @@ static struct {
     HleDispFrame f;
     bool have, using;           /* f held; inside hle_disp_use_begin */
     uint64_t serial;            /* frames taken */
-    /* FXAA's image (the frame's size), FSR's (the frame's in the window) */
-    PsImg fx, up;
+    /* FXAA's image (the frame's size), FSR's (the frame's in the window),
+     * downsampling's (the console's resolution times it) */
+    PsImg fx, up, dn;
     /* the display's gamma ramp */
     uint8_t ramp[3][256];
     uint32_t ramp_gen;
@@ -148,6 +154,7 @@ static struct {
     VkBuffer shot_buf;
     VkDeviceMemory shot_mem;
     VkDeviceSize shot_size;
+    bool shot_flush;            /* its memory isn't coherent: invalidated before it's read */
 } g_ps;
 
 #ifdef _WIN32
@@ -229,6 +236,27 @@ static const char k_fs_area[] =
     "  }\n"
     "  o = ramp(sum / wsum);\n"
     "}\n";
+/* Downsampling (into an image of ours, no ramp yet): each pixel the mean of
+ * the extra.xy frame pixels it covers, up to 16 a side (8x down to 1x: 8),
+ * each weighted by how much of it it covers. */
+static const char k_fs_down[] =
+    "void main() {\n"
+    "  vec2 size = vec2(textureSize(u_tex, 0));\n"
+    "  vec2 r = clamp(pc.extra.xy, vec2(1.0), vec2(16.0));\n"
+    "  vec2 lo = v_uv * size - 0.5 * r, hi = lo + r;\n"
+    "  ivec2 i0 = ivec2(floor(lo)), i1 = ivec2(ceil(hi)) - 1, top = ivec2(size) - 1;\n"
+    "  vec3 sum = vec3(0.0);\n"
+    "  float wsum = 0.0;\n"
+    "  for (int y = i0.y; y <= i1.y; y++) {\n"
+    "    float wy = min(hi.y, float(y + 1)) - max(lo.y, float(y));\n"
+    "    for (int x = i0.x; x <= i1.x; x++) {\n"
+    "      float w = (min(hi.x, float(x + 1)) - max(lo.x, float(x))) * wy;\n"
+    "      sum += w * texelFetch(u_tex, clamp(ivec2(x, y), ivec2(0), top), 0).rgb;\n"
+    "      wsum += w;\n"
+    "    }\n"
+    "  }\n"
+    "  o = vec4(sum / wsum, 1.0);\n"
+    "}\n";
 /* A CRT's look (hle_present_set_crt): the frame's lines as scanlines (a
  * gaussian beam across each source line, wider where brighter), a phosphor
  * mask on the window's pixels, the tube's curve and its darker corners.
@@ -286,7 +314,9 @@ static const char k_fs_crt[] =
     "  o = ramp(col * vig);\n"
     "}\n";
 /* The frame rate in a corner (hle_present_set_osd): four seven-segment
- * digits, green on dark, drawn by the shader alone. extra.x: the number. */
+ * digits, green on dark, drawn by the shader alone. extra.x: the number.
+ * extra.y 1: fast forward's sign instead (hle_present_set_ff), two
+ * triangles pointing right. */
 static const char k_fs_osd[] =
     "float seg(vec2 p, int m) {\n"
     "  const float t = 0.07;\n"
@@ -301,6 +331,12 @@ static const char k_fs_osd[] =
     "  return 0.0;\n"
     "}\n"
     "void main() {\n"
+    "  if (pc.extra.y > 0.5) {\n"
+    "    float lx = fract(v_uv.x * 2.0), y = abs(v_uv.y - 0.5);\n"
+    "    float on = lx > 0.14 && lx < 0.86 && y < 0.36 * (0.86 - lx) / 0.72 ? 1.0 : 0.0;\n"
+    "    o = mix(vec4(0.02, 0.07, 0.01, 1.0), vec4(0.55, 0.95, 0.16, 1.0), on);\n"
+    "    return;\n"
+    "  }\n"
     "  const int SEG[10] = int[10](0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F);\n"
     "  int n = int(pc.extra.x + 0.5);\n"
     "  int cell = int(v_uv.x * 4.0);\n"
@@ -668,7 +704,7 @@ static bool init(void)
                                         .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
                                         .queueFamilyIndex = g_hvk.qfam };
         VkSemaphoreCreateInfo si = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-        VkDescriptorSetLayout l[PS_SETS] = { g_ps.dsl, g_ps.dsl, g_ps.dsl, g_ps.dsl };
+        VkDescriptorSetLayout l[PS_SETS] = { g_ps.dsl, g_ps.dsl, g_ps.dsl, g_ps.dsl, g_ps.dsl };
         VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                                             .descriptorPool = g_ps.dp, .descriptorSetCount = PS_SETS,
                                             .pSetLayouts = l };
@@ -687,12 +723,13 @@ static bool init(void)
     }
     g_ps.vs = module(HLE_SHADER_VERTEX, k_vs, "");
     static const char *const body[P_COUNT] = { k_fs_bilinear, k_fs_area, k_fs_rcas, k_fs_crt, k_fs_osd,
-                                               k_fs_kdown, k_fs_kup, k_fs_fxaa, k_fs_easu };
+                                               k_fs_kdown, k_fs_kup, k_fs_fxaa, k_fs_easu, k_fs_down };
     for (unsigned i = 0; i < P_COUNT; i++) {
         g_ps.fs[i] = module(HLE_SHADER_FRAGMENT, k_fs_head, body[i]);
     }
     g_ps.pipe[P_FXAA] = pipeline(g_ps.fs[P_FXAA], VK_FORMAT_R8G8B8A8_UNORM);
     g_ps.pipe[P_EASU] = pipeline(g_ps.fs[P_EASU], VK_FORMAT_R8G8B8A8_UNORM);
+    g_ps.pipe[P_DOWN] = pipeline(g_ps.fs[P_DOWN], VK_FORMAT_R8G8B8A8_UNORM);
     hle_log("xbased-hle-back", "present: ready (shaders: bilinear %d, averaging %d, FSR %d, FXAA %d)",
             g_ps.fs[P_BILINEAR] != VK_NULL_HANDLE, g_ps.fs[P_AREA] != VK_NULL_HANDLE,
             g_ps.fs[P_RCAS] != VK_NULL_HANDLE && g_ps.pipe[P_EASU] != VK_NULL_HANDLE,
@@ -937,6 +974,7 @@ static void lose_window(void)
 
 static int g_crt;   /* the CRT filter's kind, 0 none */
 static float g_osd; /* the frame rate shown, 0 none */
+static bool g_osd_ff; /* fast forward's sign shown */
 
 static float g_clip_x = 1.0f, g_clip_y = 1.0f;
 
@@ -949,6 +987,11 @@ void hle_present_set_clip(float cx, float cy)
 void hle_present_set_osd(float fps)
 {
     g_osd = fps;
+}
+
+void hle_present_set_ff(bool on)
+{
+    g_osd_ff = on;
 }
 
 /* V-Sync: on (FIFO, the default), or off for whoever likes tearing
@@ -983,14 +1026,19 @@ static struct {
     int end;        /* 1 written, -1 not, 0 none since */
 } g_shot;
 
-static void shot_ended(bool ok, const char *why)
+static void shot_ended_at(const char *path, bool ok, const char *why)
 {
-    snprintf(g_shot.path, sizeof(g_shot.path), "%s", g_ps.shot_path);
+    snprintf(g_shot.path, sizeof(g_shot.path), "%s", path);
     snprintf(g_shot.why, sizeof(g_shot.why), "%s", why ? why : "");
     __atomic_store_n(&g_shot.end, ok ? 1 : -1, __ATOMIC_RELEASE);
     if (!ok) {
-        hle_log("xbased-hle-back", "present: no picture in %s: %s", g_ps.shot_path, why);
+        hle_log("xbased-hle-back", "present: no picture in %s: %s", path, why);
     }
+}
+
+static void shot_ended(bool ok, const char *why)
+{
+    shot_ended_at(g_ps.shot_path, ok, why);
 }
 
 int hle_present_shot_end(const char *path, char *why, size_t n)
@@ -1025,8 +1073,18 @@ static bool shot_buf(VkDeviceSize size)
     }
     VkMemoryRequirements mr;
     T.vkGetBufferMemoryRequirements(g_hvk.dev, g_ps.shot_buf, &mr);
-    const int mt = hle_vk_memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+    /* cached, for the CPU reads it: uncached, the picture's read took 360
+     * ms at 1280x967 for the 8 the encoding needs (#401) */
+    const VkMemoryPropertyFlags vis = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, coh = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                cached = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    int mt = hle_vk_memtype(mr.memoryTypeBits, vis | coh | cached, 0);
+    g_ps.shot_flush = false;
+    if (mt < 0 && (mt = hle_vk_memtype(mr.memoryTypeBits, vis | cached, 0)) >= 0) {
+        g_ps.shot_flush = true;     /* not coherent: invalidated before it's read */
+    }
+    if (mt < 0) {
+        mt = hle_vk_memtype(mr.memoryTypeBits, vis | coh, 0);
+    }
     VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
                                  .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt };
     if (mt < 0 || T.vkAllocateMemory(g_hvk.dev, &mai, NULL, &g_ps.shot_mem) != VK_SUCCESS) {
@@ -1039,18 +1097,42 @@ static bool shot_buf(VkDeviceSize size)
     return true;
 }
 
+/* The picture being written (#401): the present's copy of its image into
+ * the buffer (shot_buf), then a thread of its own waits for that pass,
+ * reads it, encodes it and writes the file. The presenter did all of it
+ * itself, the picture on the screen standing still meanwhile: 354 ms at
+ * 1280x967 here (the pass behind the game's frames, the JPEG, the file),
+ * more at 4K. One at a time: a picture asked for while the last one is
+ * written is taken at the next refresh after it. */
+static struct {
+    int busy;                   /* (atomic) a thread has the buffer */
+    uint64_t value;             /* the timeline's value of the pass with the copy */
+    uint32_t w, h;
+    bool rgba;
+    char path[512];
+    HleThread th;
+} g_sj;
+
 /* The picture copied out (the pass done) as a 32-bit top-down BMP, or a
- * JPEG (quality 90) for a path ending in .jpg. */
-static void shot_write(uint32_t w, uint32_t h)
+ * JPEG (quality 90) for a path ending in .jpg: g_sj's. */
+static void shot_write(void)
 {
+    const uint32_t w = g_sj.w, h = g_sj.h;
+    const bool rgba = g_sj.rgba;
+    const char *path = g_sj.path;
     void *map = NULL;
     if (T.vkMapMemory(g_hvk.dev, g_ps.shot_mem, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) {
-        shot_ended(false, "its copy couldn't be read (vkMapMemory)");
+        shot_ended_at(path, false, "its copy couldn't be read (vkMapMemory)");
         return;
     }
-    const size_t pl = strlen(g_ps.shot_path);
-    if (pl > 4 && !strcasecmp(g_ps.shot_path + pl - 4, ".jpg")) {
-        const bool rgba = g_ps.fmt == VK_FORMAT_R8G8B8A8_UNORM || g_ps.fmt == VK_FORMAT_R8G8B8A8_SRGB;
+    if (g_ps.shot_flush) {
+        const VkMappedMemoryRange mr = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE, .memory = g_ps.shot_mem,
+                                         .size = VK_WHOLE_SIZE };
+        T.vkInvalidateMappedMemoryRanges(g_hvk.dev, 1, &mr);
+    }
+    const int64_t t0 = hle_now_ns();
+    const size_t pl = strlen(path);
+    if (pl > 4 && !strcasecmp(path + pl - 4, ".jpg")) {
         const uint8_t *src = map;
         uint8_t *rgb = g_malloc((size_t)w * h * 3);
         for (size_t i = 0; i < (size_t)w * h; i++) {
@@ -1059,17 +1141,18 @@ static void shot_write(uint32_t w, uint32_t h)
             rgb[i * 3 + 2] = src[i * 4 + (rgba ? 2 : 0)];
         }
         errno = 0;
-        if (stbi_write_jpg(g_ps.shot_path, (int)w, (int)h, 3, rgb, 90)) {
-            hle_log("xbased-hle-back", "present: picture %ux%u in %s", w, h, g_ps.shot_path);
-            shot_ended(true, NULL);
+        if (stbi_write_jpg(path, (int)w, (int)h, 3, rgb, 90)) {
+            hle_log("xbased-hle-back", "present: picture %ux%u in %s (%.0f ms)", w, h, path,
+                    (double)(hle_now_ns() - t0) / 1e6);
+            shot_ended_at(path, true, NULL);
         } else {
-            shot_ended(false, errno ? strerror(errno) : "the file couldn't be written");
+            shot_ended_at(path, false, errno ? strerror(errno) : "the file couldn't be written");
         }
         g_free(rgb);
         T.vkUnmapMemory(g_hvk.dev, g_ps.shot_mem);
         return;
     }
-    FILE *f = fopen(g_ps.shot_path, "wb");
+    FILE *f = fopen(path, "wb");
     if (f) {
         const uint32_t bytes = w * h * 4;
         uint8_t hd[54] = { 'B', 'M' };
@@ -1082,7 +1165,6 @@ static void shot_write(uint32_t w, uint32_t h)
         hd[26] = 1;
         hd[28] = 32;
         fwrite(hd, 1, sizeof(hd), f);
-        const bool rgba = g_ps.fmt == VK_FORMAT_R8G8B8A8_UNORM || g_ps.fmt == VK_FORMAT_R8G8B8A8_SRGB;
         const uint8_t *src = map;
         uint8_t *row = g_malloc((size_t)w * 4);
         for (uint32_t y = 0; y < h; y++) {
@@ -1096,18 +1178,44 @@ static void shot_write(uint32_t w, uint32_t h)
         }
         g_free(row);
         fclose(f);
-        hle_log("xbased-hle-back", "present: picture %ux%u in %s", w, h, g_ps.shot_path);
-        shot_ended(true, NULL);
+        hle_log("xbased-hle-back", "present: picture %ux%u in %s (%.0f ms)", w, h, path,
+                (double)(hle_now_ns() - t0) / 1e6);
+        shot_ended_at(path, true, NULL);
     } else {
-        shot_ended(false, strerror(errno));
+        shot_ended_at(path, false, strerror(errno));
     }
     T.vkUnmapMemory(g_hvk.dev, g_ps.shot_mem);
 }
 
+static void *shot_thread(void *arg)
+{
+    (void)arg;
+    const VkResult r = hle_tl_sem_wait(g_ps.tl, g_sj.value, 5000000000ull);
+    if (r == VK_SUCCESS) {
+        shot_write();
+    } else {
+        shot_ended_at(g_sj.path, false, "its pass didn't finish (vkWaitSemaphores)");
+    }
+    __atomic_store_n(&g_sj.busy, 0, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/* the pass with the copy submitted (value: its timeline's): the thread
+ * takes it from there */
+static void shot_start(uint64_t value, uint32_t w, uint32_t h)
+{
+    g_sj.value = value;
+    g_sj.w = w;
+    g_sj.h = h;
+    g_sj.rgba = g_ps.fmt == VK_FORMAT_R8G8B8A8_UNORM || g_ps.fmt == VK_FORMAT_R8G8B8A8_SRGB;
+    snprintf(g_sj.path, sizeof(g_sj.path), "%s", g_ps.shot_path);
+    __atomic_store_n(&g_sj.busy, 1, __ATOMIC_RELEASE);
+    g_ps.shot_want = false;
+    hle_thread_create(&g_sj.th, "hle.shot", shot_thread, NULL, HLE_THREAD_DETACHED);
+}
+
 static bool ov_on(void);
-#if defined(XBEMU_HOST)
-static bool ov_changing(void);
-#endif
+static bool ov_new(void);
 /* the overlay was in the last picture: the one after it goes off isn't
  * unchanged (a still frame, a logo, kept the menu's last fading picture on
  * screen: Dead or Alive 3's, #193) */
@@ -1124,18 +1232,7 @@ bool hle_present_unchanged(struct ANativeWindow *win, uint64_t key)
         have_sc = g_rm.sh->src[g_rm.slot].vsync == (g_vsync ? 1u : 0u);
     }
 #endif
-#if defined(XBEMU_HOST)
-    /* An overlay that is up and as it was drawn leaves the picture
-     * unchanged: the host's is a still image (its menu, its frame-rate
-     * line), set again when it changes. Taken as always changing, a present
-     * went out at every call with "Show FPS" on, each waiting a refresh in
-     * the driver with the queue's lock held: Fuzion Frenzy's Twisted System
-     * fell from 59 to 40-55 frames a second, ten of them a second late. */
-    const bool ov_new = ov_changing() || (g_ov_shown && !ov_on());
-#else
-    const bool ov_new = ov_on() || g_ov_shown;
-#endif
-    if (ov_new || g_ps.shot_want || !g_ps.shown || !win || win != g_ps.win || g_ps.stale || !have_sc ||
+    if (ov_new() || g_ps.shot_want || !g_ps.shown || !win || win != g_ps.win || g_ps.stale || !have_sc ||
         key != g_ps.shown_key || ww != g_ps.wsize.width || wh != g_ps.wsize.height ||
         hle_disp_gamma_seq() != g_ps.ramp_gen) {
         return false;
@@ -1878,21 +1975,28 @@ static void img_pass(VkCommandBuffer cb, PsFrame *f, unsigned set, PsImg *t, VkP
 }
 
 /* How the frame meets the window, logged when that changes. */
-static void log_path(unsigned p, bool fxaa, uint32_t vw, uint32_t vh)
+static void log_path(unsigned p, bool fxaa, uint32_t dw, uint32_t dh, uint32_t vw, uint32_t vh)
 {
     static unsigned s_p = ~0u;
     static bool s_fxaa;
-    static uint32_t s_w, s_h, s_vw, s_vh;
-    if (p == s_p && fxaa == s_fxaa && g_ps.f.w == s_w && g_ps.f.h == s_h && vw == s_vw && vh == s_vh) {
+    static uint32_t s_w, s_h, s_dw, s_dh, s_vw, s_vh;
+    if (p == s_p && fxaa == s_fxaa && g_ps.f.w == s_w && g_ps.f.h == s_h && dw == s_dw && dh == s_dh &&
+        vw == s_vw && vh == s_vh) {
         return;
     }
     s_p = p;
     s_fxaa = fxaa;
     s_w = g_ps.f.w;
     s_h = g_ps.f.h;
+    s_dw = dw;
+    s_dh = dh;
     s_vw = vw;
     s_vh = vh;
-    hle_log("xbased-hle-back", "present: %ux%u%s into %ux%u: %s", s_w, s_h, fxaa ? " after FXAA" : "", vw, vh,
+    char d[48] = "";
+    if (dw) {
+        snprintf(d, sizeof(d), ", downsampled to %ux%u", dw, dh);
+    }
+    hle_log("xbased-hle-back", "present: %ux%u%s%s into %ux%u: %s", s_w, s_h, fxaa ? " after FXAA" : "", d, vw, vh,
             p == P_AREA ? "averaged down" : p == P_RCAS ? "scaled up by FSR" : "bilinear");
 }
 
@@ -1950,14 +2054,14 @@ static bool ov_on(void)
     return g_ov.on;
 }
 
-#if defined(XBEMU_HOST)
-/* The overlay's picture is not the one last drawn: a texture of it was
- * written or freed since, or it shows the scene behind it (which moves). */
-static bool ov_changing(void)
+/* The overlay changes the picture: on and new since the last one, or over
+ * the picture itself (its blur), or textures to write; or off now and in
+ * the last one. One unchanged since the last picture, which had it, leaves
+ * it unchanged too (hle_present_unchanged). */
+static bool ov_new(void)
 {
-    return g_ov.on && (g_ov.dirty || g_ov.scene || g_ov.blur);
+    return ov_on() ? !g_ov_shown || g_ov.scene || g_ov.blur || g_ov.dirty : g_ov_shown;
 }
-#endif
 
 uint64_t hle_present_count(void)
 {
@@ -2033,6 +2137,14 @@ void hle_ov_tex_free(uint32_t id)
 
 void hle_present_set_overlay(const HleOvVert *v, uint32_t nv, const HleOvCmd *c, uint32_t nc, uint32_t flags)
 {
+    /* the same as the one on: nothing to draw again (#401: a notice held
+     * still, sent each refresh, had every refresh presented, 280 a second
+     * on this display instead of the game's 60, the picture scaled down
+     * from its render size each time, and games slowed while it showed) */
+    if (g_ov.on && v && c && nv == g_ov.nv && nc == g_ov.nc && flags == g_ov.flags &&
+        !memcmp(v, g_ov.v, nv * sizeof(*v)) && !memcmp(c, g_ov.c, nc * sizeof(*c))) {
+        return;
+    }
     g_ps.shown = false;                 /* drawn again, with or without */
     if (!v || !c || !nv || !nc) {
         g_ov.on = false;
@@ -2590,9 +2702,8 @@ static void remote_end(VkCommandBuffer cb, PsFrame *f, VkImage dst, bool shot, u
     f->value = value;
     g_rm.v = v;
     g_rm.val[g_ps.idx] = v;
-    if (shot && wait_value(value)) {
-        shot_write(iw, ih);
-        g_ps.shot_want = false;
+    if (shot) {
+        shot_start(value, iw, ih);
     }
     /* when it is due: a frame's first picture (one drawn again for the
      * overlay over it comes as it is) */
@@ -2641,7 +2752,7 @@ static void remote_end(VkCommandBuffer cb, PsFrame *f, VkImage dst, bool shot, u
 }
 #endif
 
-void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, uint64_t key)
+void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, int down, uint64_t key)
 {
     g_ps.shown = false;
     PsFrame *f = &g_ps.fr[g_ps.cur];
@@ -2689,29 +2800,53 @@ void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, u
             g_ps.pipe[P_FXAA] = VK_NULL_HANDLE;     /* no image for it: FXAA off */
         }
     }
+    /* downsampling: a frame at a render scale above `down` averaged into
+     * an image at the console's resolution times it, which goes on as the
+     * frame (a new frame, FXAA's or not, or a new size: made again) */
+    uint32_t fw = g_ps.f.w, fh = g_ps.f.h, dw = 0, dh = 0;
+    const int scale = (int)g_hle_rscale;       /* the scale its slots were made at */
+    if (g_ps.have && down > 0 && scale > down && g_ps.pipe[P_DOWN]) {
+        dw = g_ps.f.w * (uint32_t)down / (uint32_t)scale;
+        dh = g_ps.f.h * (uint32_t)down / (uint32_t)scale;
+        if (!dw || !dh || dw >= g_ps.f.w || !img_target(&g_ps.dn, dw, dh, VK_FORMAT_R8G8B8A8_UNORM, "downsampling")) {
+            dw = dh = 0;
+        }
+    }
+    if (dw) {
+        if (g_ps.dn.serial != g_ps.serial || g_ps.dn.fxaa != fxaa_done) {
+            const float extra[4] = { (float)g_ps.f.w / (float)dw, (float)g_ps.f.h / (float)dh, 0.0f, 0.0f };
+            img_pass(cb, f, SET_DOWN, &g_ps.dn, g_ps.pipe[P_DOWN], src, extra);
+            g_ps.dn.serial = g_ps.serial;
+            g_ps.dn.fxaa = fxaa_done;
+        }
+        src = g_ps.dn.view;
+        fw = dw;
+        fh = dh;
+    }
     /* the frame's pixels per window pixel: over 1 (either axis) averaged
      * down, under 1 scaled up as chosen; FSR's EASU into its image first
      * (a new frame, or a new size), its RCAS on the way into the window */
     const float vw = sx * (float)ww, vh = sy * (float)wh;
-    const float rx = g_ps.have ? (float)g_ps.f.w / vw : 1.0f, ry = g_ps.have ? (float)g_ps.f.h / vh : 1.0f;
-    const bool down = (rx > 1.01f || ry > 1.01f) && average && g_ps.pipe[P_AREA];
-    bool fsr = g_ps.have && !down && !g_crt && (rx < 0.99f || ry < 0.99f) && upscale == HLE_UPSCALE_FSR &&
+    const float rx = g_ps.have ? (float)fw / vw : 1.0f, ry = g_ps.have ? (float)fh / vh : 1.0f;
+    const bool area = (rx > 1.01f || ry > 1.01f) && average && g_ps.pipe[P_AREA];
+    bool fsr = g_ps.have && !area && !g_crt && (rx < 0.99f || ry < 0.99f) && upscale == HLE_UPSCALE_FSR &&
                g_ps.pipe[P_EASU] && g_ps.pipe[P_RCAS];
     if (fsr && !img_target(&g_ps.up, (uint32_t)(vw + 0.5f), (uint32_t)(vh + 0.5f), VK_FORMAT_R8G8B8A8_UNORM, "FSR")) {
         g_ps.pipe[P_EASU] = VK_NULL_HANDLE;         /* no image for it: bilinear */
         fsr = false;
     }
-    if (fsr && (g_ps.up.serial != g_ps.serial || g_ps.up.fxaa != fxaa_done)) {
-        const float extra[4] = { (float)g_ps.f.w, (float)g_ps.f.h, (float)g_ps.up.w, (float)g_ps.up.h };
+    if (fsr && (g_ps.up.serial != g_ps.serial || g_ps.up.fxaa != fxaa_done || g_ps.up.down != (dw != 0))) {
+        const float extra[4] = { (float)fw, (float)fh, (float)g_ps.up.w, (float)g_ps.up.h };
         img_pass(cb, f, SET_EASU, &g_ps.up, g_ps.pipe[P_EASU], src, extra);
         g_ps.up.serial = g_ps.serial;
         g_ps.up.fxaa = fxaa_done;
+        g_ps.up.down = dw != 0;
     }
     /* the picture's pass: p over the frame's place, from `from` */
     unsigned p = P_BILINEAR;
     float pc[12] = { -sx, -sy, sx, sy, 0.0f, 0.0f, 0.0f, 0.0f, g_ps.rot[0], g_ps.rot[1], g_ps.rot[2], g_ps.rot[3] };
     VkImageView from = src;
-    if (down) {
+    if (area) {
         p = P_AREA;
         pc[4] = rx;
         pc[5] = ry;
@@ -2723,7 +2858,7 @@ void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, u
     if (g_crt && g_ps.pipe[P_CRT]) {
         p = P_CRT;
         pc[4] = (float)g_crt;
-        pc[5] = (float)hle_host_render_scale();
+        pc[5] = (float)(dw ? down : hle_host_render_scale());   /* the console's lines: the frame's over it */
         from = src;
     }
     /* the overlay: its textures first, the picture as one under a cover */
@@ -2770,14 +2905,21 @@ void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, u
                              g_ps.rot[0], g_ps.rot[1], g_ps.rot[2], g_ps.rot[3] };
             quad(cb, f, SET_OSD, g_ps.pipe[P_OSD], src, oc, iw, ih);
         }
-        log_path(p, fxaa_done, (uint32_t)(vw + 0.5f), (uint32_t)(vh + 0.5f));
+        if (g_osd_ff && g_ps.pipe[P_OSD]) {
+            /* fast forward on (#404): its sign top right, three digits wide */
+            const float dh = 0.045f, dw = dh * 0.62f * (float)wh / (float)ww;
+            float oc[12] = { 0.98f - 3 * dw * 2, -0.97f, 0.98f, -0.97f + dh * 2, 0, 1, 0, 0,
+                             g_ps.rot[0], g_ps.rot[1], g_ps.rot[2], g_ps.rot[3] };
+            quad(cb, f, SET_OSD, g_ps.pipe[P_OSD], src, oc, iw, ih);
+        }
+        log_path(p, fxaa_done, dw, dh, (uint32_t)(vw + 0.5f), (uint32_t)(vh + 0.5f));
     }
     if (ov) {
         ov_draw(cb, f, iw, ih, scene_ok);
     }
     T.vkCmdEndRendering(cb);
     bool shot = false;
-    if (g_ps.shot_want) {
+    if (g_ps.shot_want && !__atomic_load_n(&g_sj.busy, __ATOMIC_ACQUIRE)) {
         if (!g_ps.shot_can) {
             shot_ended(false, "the window's pictures can't be copied (its swapchain has no transfer source)");
             g_ps.shot_want = false;
@@ -2847,9 +2989,8 @@ void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, u
     if (r == VK_SUCCESS) {
         g_ps.submitted = value;
         f->value = value;
-        if (shot && wait_value(value)) {
-            shot_write(iw, ih);
-            g_ps.shot_want = false;
+        if (shot) {
+            shot_start(value, iw, ih);
         }
     } else {
         hle_vk_check(r, "vkQueueSubmit2 (present)");

@@ -451,7 +451,7 @@ impl Gpu {
             // SAFETY: plain values; documented as callable from any thread
             // (pb/pbmode.h), and `hle_init` ran.
             unsafe {
-                ffi::hle_pb_display_mode(pitch, format, hz);
+                ffi::hle_pb_display_mode(pitch, format, hz, self.shared.nv.av_mode_width());
                 if frame_buffer != 0 {
                     ffi::hle_pb_display_fb(frame_buffer);
                 }

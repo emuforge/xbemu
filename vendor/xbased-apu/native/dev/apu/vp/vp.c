@@ -170,6 +170,9 @@ static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
     memset(vf->lfo_wait, 0, sizeof(vf->lfo_wait));
     vf->lfo_armed = false;
     vf->hrtf.params_set = false;
+    vf->ear_level_set = false;
+    memset(vf->ear_hist, 0, sizeof(vf->ear_hist));
+    memset(vf->ear_acf, 0, sizeof(vf->ear_acf));
     hrtf_filter_clear_history(&vf->hrtf);
 }
 
@@ -2084,6 +2087,9 @@ static void voice_process(MCPXAPUState *d, uint8_t *c,
         memset(vf->peq, 0, sizeof(vf->peq));
         memset(vf->i3dl2, 0, sizeof(vf->i3dl2));
         hrtf_filter_clear_history(&vf->hrtf);
+        memset(vf->ear_hist, 0, sizeof(vf->ear_hist));
+        memset(vf->ear_acf, 0, sizeof(vf->ear_acf));
+        vf->ear_level_set = false;
         vf->muted_prev = false;
     }
 #endif
@@ -2224,11 +2230,60 @@ static void voice_process(MCPXAPUState *d, uint8_t *c,
      * frame. */
     float ears[NUM_SAMPLES_PER_FRAME][2];
     if (spatial) {
-        if (__atomic_load_n(&g_apu_config.hrtf, __ATOMIC_RELAXED) && APU_CHECK(hrtf_handle < HRTF_ENTRY_COUNT)) {
+        const bool entry = APU_CHECK(hrtf_handle < HRTF_ENTRY_COUNT);
+        if (entry && __atomic_load_n(&g_apu_config.hrtf, __ATOMIC_RELAXED)) {
             hrtf_filter_set_target_params(&vf->hrtf,
                                           d->vp.hrtf.entries[hrtf_handle].hrir,
                                           d->vp.hrtf.entries[hrtf_handle].itd);
             hrtf_filter_process(&vf->hrtf, samples, ears);
+            vf->ear_level_set = false;
+        } else if (entry) {
+            /* HRTF filtering off (#374): the voice unfiltered and undelayed
+             * in each ear, at the level its HRIR gives that ear for this
+             * sound. Unfiltered at full scale, a 3D voice came out 7 to 8 dB
+             * louder than through its HRIR, beside 2D voices as they are:
+             * Max Payne's gunshots over its dialogue (#410). The level is
+             * the filter's power gain for the sound's own spectrum,
+             * sqrt(h' R h / R(0)) with R the voice's autocorrelation over
+             * the last frames (lags 0-30, the HRIR's length): the taps'
+             * energy alone, a white sound's gain, left gunshots 2 to 6 dB
+             * under the filter's. Moved from the last frame's level across
+             * the frame, as the filter's taps are. */
+            const float(*h)[HRTF_NUM_TAPS] = d->vp.hrtf.entries[hrtf_handle].hrir;
+            float x[HRTF_NUM_TAPS + NUM_SAMPLES_PER_FRAME];
+            memcpy(x, vf->ear_hist, sizeof(vf->ear_hist));
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                x[HRTF_NUM_TAPS + i] = samples[i][0];
+            }
+            memcpy(vf->ear_hist, x + NUM_SAMPLES_PER_FRAME, sizeof(vf->ear_hist));
+            for (int m = 0; m < HRTF_NUM_TAPS; m++) {
+                float r = 0.0f;
+                for (int i = HRTF_NUM_TAPS; i < HRTF_NUM_TAPS + NUM_SAMPLES_PER_FRAME; i++) {
+                    r += x[i] * x[i - m];
+                }
+                /* (about 10 ms: 16 frames) */
+                vf->ear_acf[m] += (r - vf->ear_acf[m]) * (1.0f / 16.0f);
+            }
+            for (int ch = 0; ch < 2; ch++) {
+                float to = vf->ear_level_set ? vf->ear_level[ch] : 0.0f;
+                if (vf->ear_acf[0] > 1e-20f) {
+                    float p = 0.0f;
+                    for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+                        float hr = 0.0f;
+                        for (int j = 0; j < HRTF_NUM_TAPS; j++) {
+                            hr += h[ch][j] * vf->ear_acf[k > j ? k - j : j - k];
+                        }
+                        p += h[ch][k] * hr;
+                    }
+                    to = sqrtf(fmaxf(p, 0.0f) / vf->ear_acf[0]);
+                }
+                const float from = vf->ear_level_set ? vf->ear_level[ch] : to;
+                vf->ear_level[ch] = to;
+                for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                    ears[i][ch] = samples[i][0] * (from + (to - from) * (i / (float)NUM_SAMPLES_PER_FRAME));
+                }
+            }
+            vf->ear_level_set = true;
         } else {
             memcpy(ears, samples, sizeof(ears));
         }

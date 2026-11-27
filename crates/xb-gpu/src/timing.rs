@@ -41,6 +41,31 @@ const FRAME_DUE_SPAN: u64 = 4_000_000;
 /// Slack added to half a pace when deciding a flip came late on its slot.
 const EARLY_POLL_NS: u64 = 250_000;
 
+/// How many pickups the turn round the refresh is summed over.
+const PICK_TURN_N: usize = 64;
+
+/// The presenter's pickups' turn round the refresh over the last
+/// [`PICK_TURN_N`] of them ([`Nv2a::display_pickup`]).
+#[derive(Debug)]
+pub(crate) struct PickTurn {
+    /// Each pickup's step from the one before.
+    step: [i64; PICK_TURN_N],
+    /// Their sum.
+    turn: i64,
+    /// The last pickup's place after a vsync; negative: none yet.
+    last: i64,
+    /// Pickups counted.
+    n: usize,
+    /// The pickups turn (logged when it changes).
+    turning: bool,
+}
+
+impl Default for PickTurn {
+    fn default() -> Self {
+        Self { step: [0; PICK_TURN_N], turn: 0, last: -1, n: 0, turning: false }
+    }
+}
+
 /// The host display's refreshes as the vblank keeps to them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Grid {
@@ -125,6 +150,15 @@ impl<D: Decoder, C: Clock> Nv2a<D, C> {
 
     /// The presenter looked for a frame at `ns`: the vblank keeps half a
     /// period clear of where it picks frames up.
+    ///
+    /// A presenter that picks frames up as its GPU finishes them rather than
+    /// by the vsyncs (a GPU at its limit) takes them round the refresh at
+    /// its own pace, and an estimate that followed them would take the
+    /// vblank's grid along and change the title's frame rate. While the
+    /// pickups turn more than a quarter of a refresh over the last
+    /// `PICK_TURN_N`, the estimate stays where it was; a presenter's
+    /// jitter, back and forth, adds up to less. As the reference does
+    /// (Crash Bandicoot with the frame rate limit on a GPU at its limit).
     pub fn display_pickup(&self, ns: u64) {
         let vs = self.disp_vsync_ns.load(Ordering::Acquire);
         let pd = self.disp_period_ns.load(Ordering::Relaxed) as i64;
@@ -136,6 +170,32 @@ impl<D: Decoder, C: Clock> Nv2a<D, C> {
             off += pd;
         }
         let est = self.pick_off_ns.load(Ordering::Relaxed);
+        {
+            let mut t = crate::nv2a::lock(&self.pick_turn);
+            let step = if t.last < 0 { 0 } else { wrap_half(off - t.last, pd) };
+            t.last = off;
+            let slot = t.n % PICK_TURN_N;
+            t.turn += step - t.step[slot];
+            t.step[slot] = step;
+            t.n += 1;
+            let turning = t.n >= PICK_TURN_N && t.turn.abs() > pd / 4;
+            if turning != t.turning {
+                t.turning = turning;
+                log::info!(
+                    target: "gpu",
+                    "the presenter's pickups {} ({:.1} ms over the last {PICK_TURN_N})",
+                    if turning {
+                        "turn round the refresh (it waits for its GPU): the vblank keeps its place"
+                    } else {
+                        "keep to the vsyncs again"
+                    },
+                    t.turn as f64 / 1e6
+                );
+            }
+            if turning && est >= 0 {
+                return;
+            }
+        }
         let est = if est < 0 { off } else { est + wrap_half(off - est, pd) / 16 };
         self.pick_off_ns.store((est % pd + pd) % pd, Ordering::Relaxed);
     }
@@ -442,6 +502,34 @@ mod tests {
         // Settled 3 ms before a vsync (no pickups seen yet).
         let phase = wrap_half(t as i64 - vsync as i64 + VSYNC_LEAD, period as i64);
         assert!(phase.abs() < 100_000, "phase error {phase} ns");
+    }
+
+    #[test]
+    fn pickups_that_turn_round_the_refresh_leave_the_estimate_and_jitter_moves_it() {
+        let period = 16_666_667u64;
+        // A presenter that picks a frame up every 15 ms beside 60 Hz vsyncs.
+        let r = rig();
+        feed(&r, period, 8);
+        let vsync = r.clock.now_ns();
+        let mut held = None;
+        for i in 0..400u64 {
+            r.nv.display_pickup(vsync + i * 15_000_000);
+            let est = r.nv.pick_off_ns.load(Ordering::Relaxed);
+            if i >= PICK_TURN_N as u64 {
+                assert_eq!(*held.get_or_insert(est), est, "pickup {i} moved the estimate");
+            }
+        }
+        // One that keeps to the vsyncs, 1 ms to either side of 6 ms after.
+        let r = rig();
+        feed(&r, period, 8);
+        let vsync = r.clock.now_ns();
+        r.nv.display_pickup(vsync + 12_000_000);
+        for i in 1..400u64 {
+            let jitter = if i % 2 == 0 { 1_000_000 } else { -1_000_000i64 };
+            r.nv.display_pickup((vsync + i * period + 6_000_000).wrapping_add_signed(jitter));
+        }
+        let est = r.nv.pick_off_ns.load(Ordering::Relaxed);
+        assert!((est - 6_000_000).abs() < 1_100_000, "the estimate followed them to {est}");
     }
 
     #[test]

@@ -5,8 +5,8 @@ The emulation of the Xbox's MCPX audio processing unit used by the crate
 
 ## Source
 
-- **xbased 1.2.5**, directory `native/dev/apu`, commit
-  `2031611e0aebed3c3852af16a63108cabd9554a0` of
+- **xbased 1.2.12**, directory `native/dev/apu`, commit
+  `577f3b8841e166177c613356050f94980622d579` of
   <https://github.com/crazyriddler/xbased>.
 - xbased's APU is xemu's device (`hw/xbox/mcpx/apu`) ported from QEMU's
   services onto xbased's own; the DSP56300 emulator inside it comes from

@@ -143,6 +143,7 @@ pub struct Nv2a<D: Decoder, C: Clock> {
     pub(crate) vblank_locked: AtomicBool,
     pub(crate) vblank_timed: AtomicBool,
     pub(crate) pick_off_ns: AtomicI64,
+    pub(crate) pick_turn: Mutex<crate::timing::PickTurn>,
     pub(crate) trap_slot_ns: AtomicU64,
     pub(crate) trap_every_ns: AtomicU64,
     pub(crate) slot_given_ns: AtomicU64,
@@ -193,6 +194,7 @@ impl<D: Decoder, C: Clock> Nv2a<D, C> {
             vblank_locked: AtomicBool::new(false),
             vblank_timed: AtomicBool::new(false),
             pick_off_ns: AtomicI64::new(-1),
+            pick_turn: Mutex::new(crate::timing::PickTurn::default()),
             trap_slot_ns: AtomicU64::new(0),
             trap_every_ns: AtomicU64::new(0),
             slot_given_ns: AtomicU64::new(0),
@@ -648,6 +650,20 @@ impl<D: Decoder, C: Clock> Nv2a<D, C> {
     /// Records the AV mode word of `AvSetDisplayMode`.
     pub fn set_av_mode(&self, mode: u32) {
         self.av_mode.store(mode, Ordering::Relaxed);
+    }
+
+    /// The width of the AV mode last set, where its timing (the mode's bits
+    /// 15:8) tells it, as the reference has them: 640 for the
+    /// standard-definition and 480p modes whose frame buffers show that
+    /// width, 720 for the others of those, and 0 for the rest (HD among
+    /// them), where the frame buffer's pitch tells. Max Payne keeps
+    /// its graphic novel in a buffer wider than the mode shows.
+    pub fn av_mode_width(&self) -> u32 {
+        match (self.av_mode() >> 8) & 0xFF {
+            0x01 | 0x03 | 0x05 | 0x07 | 0x0D | 0x0E | 0x0F => 640,
+            0x02 | 0x04 | 0x08 => 720,
+            _ => 0,
+        }
     }
 
     /// The picture shape the title asked Direct3D for: 0 unknown, 1 4:3,

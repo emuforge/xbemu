@@ -124,6 +124,9 @@ typedef struct HleSurfDesc {
     uint32_t parent;
     uint16_t levels, faces;
     uint16_t level, face;
+    /* 1: at guest resolution whatever the scale (a filter's taps read it,
+     * pb/pbdraw.c obj_native) */
+    uint16_t native, pad;
 } HleSurfDesc;
 
 typedef struct HleCmdDevice {
@@ -231,6 +234,9 @@ typedef struct HleCmdReadback {
     /* HLE_RB_DIRECT: the rows from the top that go to memory, the ones the
      * GPU drew (0: all of them); the landing (fb_len) holds those */
     uint32_t rows;
+    /* HLE_RB_DIRECT: the rows of a swizzled surface's image, its memory
+     * written through a linear view of it (pbdraw.c coh_land) */
+    uint32_t view;
 } HleCmdReadback;
 #define HLE_RB_DIRECT 0xFFFFFFFFu
 /* arena_off: the subresource packed as above into the landing buffer (the

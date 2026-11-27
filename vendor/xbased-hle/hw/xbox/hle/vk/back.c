@@ -2215,7 +2215,8 @@ static void cmd_readback(const HleCmdReadback *c)
      * guest data (swizzled readback is P4). An image the GPU never wrote
      * (layout UNDEFINED) holds nothing newer than guest memory: skip it so
      * CPU-written data survives. */
-    bool linear = s && s->d.pitch && fi && (fi->flags & HLE_FI_LIN);
+    bool linear = s && fi && ((s->d.pitch && (fi->flags & HLE_FI_LIN)) ||
+                              (c->view && !(fi->flags & (HLE_FI_DEPTH | HLE_FI_DXT))));
     bool written = s && s->img && s->layout != VK_IMAGE_LAYOUT_UNDEFINED;
     uint32_t w = s ? (c->w ? c->w : s->d.w) : 0, h = s ? (c->h ? c->h : s->d.h) : 0;
     /* the rows the decoder asked for, the ones the GPU drew (its landing is

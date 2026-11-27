@@ -136,6 +136,11 @@ pub trait GpuHost: Send + Sync + 'static {
     /// (`hle_host_frame_flipped`.)
     fn frame_flipped(&self);
 
+    /// The holds so far that ended at their longest with no flip come. The
+    /// renderer stops asking for holds while the count grows.
+    /// (`hle_host_frame_holds_timed_out`.)
+    fn frame_holds_timed_out(&self) -> u32;
+
     /// The guest CPU's registers as last known, or `None` before boot.
     /// Diagnostics only. (`hle_host_cpu`.)
     fn cpu_regs(&self) -> Option<CpuRegs>;

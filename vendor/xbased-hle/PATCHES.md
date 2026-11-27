@@ -1,5 +1,6 @@
 # Changes to the vendored files
 
+The base is xbased 1.2.12 with one later fix (`README.md`).
 `crates/xb-gpu/build.rs` defines `XBEMU_HOST=1`. Changes 1 to 13 and 17
 to 20 are each inside `#if defined(XBEMU_HOST)` (or widen an existing `#if`
 with it); without the define those compile as xbased's do. Changes 14 to 16 are not
@@ -122,7 +123,7 @@ scale twice on a running title.
 
 ## 7. The decoder's savestate section, as the reference writes it
 
-Files of xbased added as they are (xbased 1.2.5), not changed:
+Files of xbased added as they are (xbased 1.2.12), not changed:
 `native/state/def.h`, `state.h`, `lock.h`, `sections.h` and `pbd.def`: the
 description of the three records of `pbstate.h` field by field, each field
 with the section versions it is stored in, and the header that turns it
@@ -176,16 +177,13 @@ forces the copy.
 
 ## 9. An overlay that has not changed does not force a present
 
-- `hw/xbox/hle/vk/swapchain.c`: `hle_present_unchanged` takes an overlay
-  that is up as a change only while `ov_changing()` says so (a texture of
-  it written or freed since the last picture, or it shows the scene), and
-  the picture after an overlay goes off, as before.
-
-Why: xbased's overlay is its animated menu, so an overlay up means the
-picture always changes. xbemu's is a still image set again when it changes
-(the menu, the frame-rate line). A present waits a refresh in the driver
-with the queue's lock held, and the render thread's submits wait behind it;
-with "Show FPS" on, an unchanged overlay must not cause one at every call.
+Not a change: xbased's own `ov_new` in `hw/xbox/hle/vk/swapchain.c` does
+this (an overlay that is up counts as a change only when it is new since the
+last picture, shows the scene, or has textures to write), and the file
+carries nothing of xbemu's for it. xbemu relies on it: its overlay is a
+still image set again when it changes (the menu, the frame-rate line), and
+with "Show FPS" on an unchanged overlay must not cause a present at every
+call. The number is kept so the others keep theirs.
 
 ## 10. A constant or program word sent again unchanged changes nothing
 

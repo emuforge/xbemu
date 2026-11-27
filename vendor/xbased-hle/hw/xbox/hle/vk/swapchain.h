@@ -33,9 +33,11 @@ bool hle_present_frame(uint32_t *w, uint32_t *h);
 /* end: the frame drawn into the window's middle (sx, sy: its half size in
  * clip space, 1 the whole window), the rest black, through the display's
  * gamma ramp, and presented. fxaa: FXAA over each new frame first; average:
- * false samples a frame larger than its place bilinearly too (comparisons).
- * key: what hle_present_unchanged compares next. */
-void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, uint64_t key);
+ * false samples a frame larger than its place bilinearly too (comparisons);
+ * down: a frame at a render scale above it averaged to the console's
+ * resolution times it first (1, 2, 4; 0 none). key: what
+ * hle_present_unchanged compares next. */
+void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, int down, uint64_t key);
 
 /* A picture of the next refresh that goes through, as the window shows it,
  * written to path (a BMP) on the window's thread. */
@@ -50,6 +52,8 @@ void hle_present_set_crt(int kind);
 void hle_present_set_vsync(bool on);
 /* The frame rate shown in the window's corner, 0 none (any thread). */
 void hle_present_set_osd(float fps);
+/* Fast forward on (#404): a >> in the picture's top right corner. */
+void hle_present_set_ff(bool on);
 /* Windows: the pictures drawn for the game's frame (vk/share.h, token: its
  * block's) instead of the window's own swapchain, from the next refresh;
  * hle_present_remote, once they are. */
