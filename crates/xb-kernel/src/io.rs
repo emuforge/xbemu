@@ -406,12 +406,6 @@ impl Kernel {
         }
     }
 
-    /// Whether the disc has language folders, English's among them, and none
-    /// for XC_LANGUAGE `lang` next to it.
-    pub(crate) fn io_disc_lacks_language(&self, lang: u32) -> bool {
-        self.io.disc.as_ref().is_some_and(|tree| xb_fs::disc_lacks_language(tree.as_ref(), lang))
-    }
-
     /// The guest CPU idled for `host` with requests in flight (the
     /// scheduler's wait): for the statistics.
     pub(crate) fn io_idled(&mut self, host: Duration) {

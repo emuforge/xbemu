@@ -535,7 +535,7 @@ pub struct FileState {
     pub position: u64,
     /// A directory enumeration is under way...
     pub dir_started: bool,
-    /// ... at this entry of the listing...
+    /// ... past this many entries of the folder's whole listing...
     pub dir_next: u64,
     /// ... with this pattern.
     pub dir_mask: String,
@@ -586,22 +586,41 @@ impl File {
             options: self.opened.2,
             position: self.position(),
             dir_started: dir.listing.is_some(),
-            dir_next: dir.next as u64,
+            dir_next: self.whole_next(&dir) as u64,
             dir_mask: dir.mask.clone(),
         }
     }
 
+    /// The volume's listing of this directory ([`VolumeFile::list`]).
+    #[cfg(test)]
+    pub(crate) fn list(&self, keep: &dyn Fn(&str) -> bool) -> Vec<DirEntry> {
+        self.node.list(keep)
+    }
+
+    /// How far an enumeration is into the folder's whole listing, taken
+    /// now: past the entry it last gave. That is what a savestate holds, so
+    /// a state does not depend on the enumeration's own listing holding
+    /// only what its mask matches.
+    fn whole_next(&self, dir: &DirState) -> usize {
+        let last = dir.next.checked_sub(1).and_then(|i| dir.listing.as_ref()?.get(i));
+        let Some(last) = last else { return 0 };
+        let whole = self.node.list(&|_| true);
+        whole.iter().position(|e| e.name == last.name).map_or(whole.len(), |i| i + 1)
+    }
+
     /// Puts a file just opened again where `state` says the saved one was:
-    /// its pointer, and a directory enumeration at the same entry of a
+    /// its pointer, and a directory enumeration past the same entries of a
     /// listing taken now.
     fn restore(&self, state: &FileState) {
         self.set_position(state.position);
         if state.dir_started {
             let mut dir = lock(&self.dir);
-            let listing = self.node.list();
-            dir.next = (state.dir_next as usize).min(listing.len());
+            let whole = self.node.list(&|_| true);
+            let passed = (state.dir_next as usize).min(whole.len());
+            let matches = |e: &DirEntry| wildcard_match(&state.dir_mask, &e.name);
+            dir.next = whole[..passed].iter().filter(|e| matches(e)).count();
             dir.mask.clone_from(&state.dir_mask);
-            dir.listing = Some(listing);
+            dir.listing = Some(whole.into_iter().filter(matches).collect());
         }
     }
 
@@ -956,6 +975,8 @@ impl File {
     ///
     /// The directory is listed once when an enumeration starts: on the first
     /// call, when `restart_scan` is set, or when a different mask is given.
+    /// The listing holds only the entries the mask matches, as the
+    /// reference's does ([`VolumeFile::list`]).
     /// `mask` is the guest's `FileMask`: `None` (FindNextFile) goes on with
     /// the enumeration's mask, an empty one matches everything. Riddick's
     /// `FindFirstFile("_filler???")` / `FindNextFile` loop deletes what it is
@@ -985,26 +1006,20 @@ impl File {
         };
         if restart_scan || mask != dir.mask || dir.listing.is_none() {
             dir.next = 0;
+            dir.listing = Some(self.node.list(&|name| wildcard_match(&mask, name)));
             dir.mask = mask;
-            dir.listing = Some(self.node.list());
         }
         let DirState { listing, next, mask } = &mut *dir;
         let entries = listing.as_deref().unwrap_or_default();
-        let Some(i) = (*next..entries.len()).find(|&i| wildcard_match(mask, &entries[i].name))
-        else {
-            if *next == 0 {
-                log::debug!(
-                    target: "fs",
-                    "list {} mask '{mask}': nothing matches ({} entries)",
-                    self.path(),
-                    entries.len()
-                );
+        let i = *next;
+        let Some(entry) = entries.get(i) else {
+            if i == 0 {
+                log::debug!(target: "fs", "list {} mask '{mask}': nothing matches", self.path());
                 return Err(NtStatus::NO_SUCH_FILE);
             }
             return Err(NtStatus::NO_MORE_FILES);
         };
         *next = i + 1;
-        let entry = &entries[i];
         let info = FileDirectoryInformation {
             file_index: i as u32,
             creation_time: DISC_TIME,

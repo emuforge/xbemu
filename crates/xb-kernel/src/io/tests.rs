@@ -1247,9 +1247,18 @@ fn the_mount_puts_the_disc_and_the_hard_disks_folder_behind_the_exports() {
     assert_eq!((st, fx.bytes(buf, 5)), (STATUS_SUCCESS, b"hello".to_vec()));
     let empty = fx.open(&format!(r"{CD}\empty"), READ, FILE_OPEN, SYNC);
     assert_eq!(fx.list(empty, None, true), (Vec::new(), NtStatus::NO_SUCH_FILE.0));
-    // English has a folder, German none beside it.
-    assert!(fx.tk.k.io_disc_lacks_language(3));
-    assert!(!fx.tk.k.io_disc_lacks_language(1));
+    // English has a folder, German none: its files are simply not there.
+    let (st, ..) =
+        fx.create(0, &format!(r"{CD}\media\German\a.txt"), READ, share::ALL, FILE_OPEN, SYNC);
+    assert_eq!(st, NtStatus::OBJECT_PATH_NOT_FOUND.0);
+    let (st, ..) =
+        fx.create(0, &format!(r"{CD}\media\English\b.txt"), READ, share::ALL, FILE_OPEN, SYNC);
+    assert_eq!(st, NtStatus::OBJECT_NAME_NOT_FOUND.0);
+    // And the console's language stays as it is set.
+    fx.tk.k.console.language = 3;
+    let out = fx.mem(16);
+    let st = fx.tk.call32("ExQueryNonVolatileSetting", &[7, out + 8, out, 4, out + 12]);
+    assert_eq!((st, fx.tk.k.gm.r32(out).unwrap()), (STATUS_SUCCESS, 3));
 
     // The hard disk: a file written through the exports is a host file.
     let dash = r"\Device\Harddisk0\Partition2\xboxdash.xbe";
@@ -1298,7 +1307,6 @@ fn an_image_with_no_file_system_is_an_empty_tray() {
     fx.tk.k.io_mount(Some(blank), hdd.path()).unwrap();
     let (st, ..) = fx.create(0, r"\??\D:\default.xbe", READ, share::ALL, FILE_OPEN, SYNC);
     assert_eq!(st, NtStatus::NO_MEDIA_IN_DEVICE.0);
-    assert!(!fx.tk.k.io_disc_lacks_language(3));
     // The hard disk is there all the same.
     let (st, info, _) = fx.create(
         0,

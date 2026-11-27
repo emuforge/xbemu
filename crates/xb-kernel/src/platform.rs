@@ -57,6 +57,13 @@ pub trait Platform {
     /// presentation parameters when it set a mode: 16:9 or 4:3.
     fn set_title_widescreen(&mut self, _wide: bool) {}
 
+    /// Whether a picture shape was recorded
+    /// ([`Platform::set_title_widescreen`], or a savestate's). While none
+    /// is, `AvSetDisplayMode` looks for it even when it sets no mode.
+    fn title_shape_known(&mut self) -> bool {
+        false
+    }
+
     /// `PhyGetLinkState`: the Ethernet link as `XNET_ETHERNET_LINK_*` flags
     /// (active 1, 100 Mb/s 2, 10 Mb/s 4, full duplex 8, half duplex 16);
     /// 0 without a link.

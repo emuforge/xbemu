@@ -117,19 +117,36 @@ impl Volume for DiscVolume {
         if !matches!(params.disposition, CreateDisposition::Open | CreateDisposition::OpenIf) {
             return Err(NtStatus::MEDIA_WRITE_PROTECTED);
         }
-        let node = match self.tree.lookup(rel) {
-            Some(node) => node,
-            None => match language_fallback(self.tree.as_ref(), rel) {
-                Some((english, node)) => {
-                    log::info!(target: "fs", "open CdRom0{rel}: not on the disc, its English one instead ({english})");
-                    node
-                }
-                None => {
-                    log::info!(target: "fs", "open CdRom0{rel}: not on the disc");
-                    return Err(NtStatus::OBJECT_NAME_NOT_FOUND);
-                }
-            },
+        let Some(mut node) = self.tree.lookup(rel) else {
+            // As the console's file system answers, and the reference: a
+            // folder on the way missing (or a file) is a missing path, only
+            // the last name missing a missing name. No other file stands in
+            // for it: a title on a console set to a language its disc lacks
+            // finds that language's folder missing and goes on as on the
+            // console (Fable looks for Data\lang\Spanish\text.biz and
+            // plays in English).
+            let path_gone = parent_of(rel).is_some_and(|parent| {
+                self.tree.lookup(parent).is_none_or(|p| !(p.is_dir || lost_folder(&p)))
+            });
+            log::info!(
+                target: "fs",
+                "open CdRom0{rel}: not on the disc{}",
+                if path_gone { " (nor its folder)" } else { "" }
+            );
+            return Err(if path_gone {
+                NtStatus::OBJECT_PATH_NOT_FOUND
+            } else {
+                NtStatus::OBJECT_NAME_NOT_FOUND
+            });
         };
+        let lost = lost_folder(&node) && params.options & options::FILE_NON_DIRECTORY_FILE == 0;
+        if lost {
+            log::debug!(
+                target: "fs",
+                "open CdRom0{rel}: an empty file with no extension, taken for the empty folder a rebuilt image wrote so"
+            );
+            node.is_dir = true;
+        }
         if params.options & options::FILE_DIRECTORY_FILE != 0 && !node.is_dir {
             return Err(NtStatus::NOT_A_DIRECTORY);
         }
@@ -143,6 +160,7 @@ impl Volume for DiscVolume {
                 tree: Arc::clone(&self.tree),
                 raw: if is_volume { self.raw.clone() } else { None },
                 node,
+                lost,
                 is_volume,
                 sort_sector,
             }),
@@ -173,6 +191,8 @@ struct DiscFile {
     tree: Arc<dyn DiscTree>,
     raw: Option<Arc<dyn RawBlocks>>,
     node: DiscNode,
+    /// An empty file opened as the empty folder it was ([`lost_folder`]).
+    lost: bool,
     is_volume: bool,
     sort_sector: u32,
 }
@@ -264,16 +284,19 @@ impl VolumeFile for DiscFile {
         if delete { NtStatus::ACCESS_DENIED } else { NtStatus::SUCCESS }
     }
 
-    fn list(&self) -> Vec<DirEntry> {
-        if !self.node.is_dir {
+    fn list(&self, keep: &dyn Fn(&str) -> bool) -> Vec<DirEntry> {
+        if !self.node.is_dir || self.lost {
             return Vec::new();
         }
         self.tree
             .list(&self.node)
             .into_iter()
-            .filter(|n| n.name.chars().count() < LISTING_NAME_MAX)
+            .filter(|n| n.name.chars().count() < LISTING_NAME_MAX && keep(&n.name))
             .take(LISTING_MAX)
-            .map(|n| DirEntry { name: n.name, size: n.size, is_dir: n.is_dir })
+            .map(|n| {
+                let is_dir = n.is_dir || lost_folder(&n);
+                DirEntry { name: n.name, size: n.size, is_dir }
+            })
             .collect()
     }
 }
@@ -312,132 +335,22 @@ fn sort_sector(tree: &dyn DiscTree, rel: &str, node: &DiscNode) -> u32 {
     xbe.sector.wrapping_add(delta)
 }
 
-/// Other languages' names in paths, with English's.
-const LANGUAGE_NAMES: [(&str, &str); 28] = [
-    ("french", "english"),
-    ("german", "english"),
-    ("italian", "english"),
-    ("spanish", "english"),
-    ("japanese", "english"),
-    ("korean", "english"),
-    ("chinese", "english"),
-    ("portuguese", "english"),
-    ("fre", "eng"),
-    ("fra", "eng"),
-    ("ger", "eng"),
-    ("deu", "eng"),
-    ("ita", "eng"),
-    ("spa", "eng"),
-    ("esp", "eng"),
-    ("jpn", "eng"),
-    ("jap", "eng"),
-    ("kor", "eng"),
-    ("chi", "eng"),
-    ("por", "eng"),
-    ("fr", "en"),
-    ("de", "en"),
-    ("it", "en"),
-    ("es", "en"),
-    ("ja", "en"),
-    ("ko", "en"),
-    ("zh", "en"),
-    ("pt", "en"),
-];
-
-/// A disc path in a language the disc does not have (a console set to
-/// Spanish, a game without it, or a dump with its other languages taken out):
-/// the same path in English, the language every title has, when that is
-/// there. A path component (or a file name's stem) naming a language is what
-/// is swapped, in the same case as the title wrote it. Returns the English
-/// path and its node.
-#[must_use]
-pub fn language_fallback(tree: &dyn DiscTree, rel: &str) -> Option<(String, DiscNode)> {
-    let bytes = rel.as_bytes();
-    let mut start = 0;
-    while start < bytes.len() {
-        let end =
-            bytes[start..].iter().position(|&b| b == b'\\').map_or(bytes.len(), |p| start + p);
-        let stem = bytes[start..end].iter().position(|&b| b == b'.').map_or(end, |p| start + p);
-        for (other, english) in LANGUAGE_NAMES {
-            if !bytes[start..stem].eq_ignore_ascii_case(other.as_bytes()) {
-                continue;
-            }
-            // ENGLISH, English or english, as the title's own name is cased.
-            let first_up = bytes[start].is_ascii_uppercase();
-            let all_up = first_up && (other.len() < 2 || bytes[start + 1].is_ascii_uppercase());
-            let replacement: String = english
-                .chars()
-                .enumerate()
-                .map(
-                    |(i, c)| {
-                        if all_up || (i == 0 && first_up) { c.to_ascii_uppercase() } else { c }
-                    },
-                )
-                .collect();
-            let path = format!("{}{replacement}{}", &rel[..start], &rel[stem..]);
-            if let Some(node) = tree.lookup(&path) {
-                return Some((path, node));
-            }
-        }
-        start = end + 1;
-    }
-    None
+/// A disc entry that is an empty file with no extension in its name: the
+/// empty folder an image rebuilt from extracted files wrote as an empty
+/// file. It is taken for the empty folder it was, as the reference does:
+/// a folder's attributes, opens and listings answer so, and a file open
+/// (`FILE_NON_DIRECTORY_FILE`, what `CreateFile` asks) still opens the empty
+/// file. Marvel vs. Capcom 2's rebuilt images have `Media\sounds` so, and
+/// the title, unable to open its sound folder, stays on a black screen.
+/// Empty files with an extension are files.
+fn lost_folder(node: &DiscNode) -> bool {
+    !node.is_dir && node.size == 0 && !node.name.is_empty() && !node.name.contains('.')
 }
 
-/// Folder names for the console's language setting (`XC_LANGUAGE`: 1 English
-/// to 9 Portuguese).
-const LANGUAGE_DIRS: [&[&str]; 10] = [
-    &[],
-    &["english", "eng", "en"],
-    &["japanese", "jpn", "jap", "ja", "jp"],
-    &["german", "ger", "deu", "de"],
-    &["french", "fre", "fra", "fr"],
-    &["spanish", "spa", "esp", "es"],
-    &["italian", "ita", "it"],
-    &["korean", "kor", "ko", "kr"],
-    &["chinese", "chi", "zh", "cn"],
-    &["portuguese", "por", "pt"],
-];
-
-/// True if the disc has a folder for English somewhere in its first three
-/// levels of folders but none, beside an English one, for `language`
-/// (`XC_LANGUAGE`, 2 to 9): the title cannot run in that language, and the
-/// kernel reports English instead.
-#[must_use]
-pub fn disc_lacks_language(tree: &dyn DiscTree, language: u32) -> bool {
-    if !(2..=9).contains(&language) {
-        return false;
-    }
-    let Some(root) = tree.lookup("") else { return false };
-    let named =
-        |name: &str, lang: usize| LANGUAGE_DIRS[lang].iter().any(|d| d.eq_ignore_ascii_case(name));
-    // Breadth first, up to 64 folders, 16 subfolders of each.
-    let mut queue = vec![(root, 0u32)];
-    let mut head = 0;
-    let mut lacks = false;
-    while head < queue.len() {
-        let (dir, depth) = queue[head].clone();
-        head += 1;
-        let (mut english, mut other) = (false, false);
-        let mut subs = Vec::new();
-        for entry in tree.list(&dir).into_iter().filter(|e| e.is_dir) {
-            english |= named(&entry.name, 1);
-            other |= named(&entry.name, language as usize);
-            if subs.len() < 16 {
-                subs.push(entry);
-            }
-        }
-        if english && other {
-            return false;
-        }
-        lacks |= english;
-        for sub in subs {
-            if depth < 2 && queue.len() < 64 {
-                queue.push((sub, depth + 1));
-            }
-        }
-    }
-    lacks
+/// The folder a disc path's last name is in; `None` for a name in the root.
+fn parent_of(rel: &str) -> Option<&str> {
+    let rel = rel.trim_start_matches('\\');
+    rel.rfind('\\').map(|slash| &rel[..slash])
 }
 
 /// A disc held in memory, for tests and for homebrew handed over as loose
@@ -602,31 +515,55 @@ mod tests {
         assert!(!d.read(&d.lookup("default.xbe").unwrap(), 2, &mut buf));
     }
 
-    #[test]
-    fn a_missing_language_falls_back_to_english_in_the_same_case() {
-        let d = disc();
-        let (path, node) = language_fallback(&d, r"\sound\Spanish\intro.wav").unwrap();
-        assert_eq!(path, r"\sound\English\intro.wav");
-        assert_eq!(node.size, 5);
-        assert_eq!(language_fallback(&d, r"\text\fra.txt").unwrap().0, r"\text\eng.txt");
-        assert_eq!(language_fallback(&d, r"\movies\DEU\a.bik").unwrap().0, r"\movies\ENG\a.bik");
-        assert!(language_fallback(&d, r"\sound\Klingon\intro.wav").is_none());
-        assert!(language_fallback(&d, r"\sound\Spanish\other.wav").is_none());
+    fn open(d: &DiscVolume, rel: &str, opts: u32) -> Result<Box<dyn VolumeFile>, NtStatus> {
+        d.open(rel, &OpenParams::open(0, 0, opts)).map(|(f, _)| f)
     }
 
     #[test]
-    fn a_disc_lacks_a_language_when_only_english_has_a_folder() {
-        let d = disc();
-        assert!(disc_lacks_language(&d, 5));
-        assert!(!disc_lacks_language(&d, 1));
-        assert!(!disc_lacks_language(&d, 12));
-        let mut both = disc();
-        both.add_dir(r"sound\Spanish");
-        assert!(!disc_lacks_language(&both, 5));
-        assert!(disc_lacks_language(&both, 3));
-        let mut none = MemDisc::new();
-        none.add_file("default.xbe", b"x");
-        assert!(!disc_lacks_language(&none, 5));
+    fn a_miss_is_a_missing_path_when_its_folder_is_missing_and_a_missing_name_otherwise() {
+        let d = DiscVolume::new(Arc::new(disc()));
+        let status = |rel: &str| open(&d, rel, 0).err();
+        // No language stands in for another: the folder is simply not there.
+        assert_eq!(status(r"\sound\Spanish\intro.wav"), Some(NtStatus::OBJECT_PATH_NOT_FOUND));
+        assert_eq!(status(r"\text\fra.txt"), Some(NtStatus::OBJECT_NAME_NOT_FOUND));
+        assert_eq!(status(r"\sound\Spanish"), Some(NtStatus::OBJECT_NAME_NOT_FOUND));
+        assert_eq!(status(r"\missing.txt"), Some(NtStatus::OBJECT_NAME_NOT_FOUND));
+        // A file on the way is no folder.
+        assert_eq!(status(r"\default.xbe\x"), Some(NtStatus::OBJECT_PATH_NOT_FOUND));
+        // What is there opens as before, whatever the case.
+        assert_eq!(open(&d, r"\SOUND\english\INTRO.WAV", 0).unwrap().size(), 5);
+    }
+
+    #[test]
+    fn an_empty_file_without_an_extension_is_the_empty_folder_a_rebuilt_image_wrote() {
+        let mut d = disc();
+        d.add_file(r"Media\sounds", b"").add_file(r"Media\Dummy.txt", b"");
+        let d = DiscVolume::new(Arc::new(d));
+        // A folder for attributes, directory opens and listings ...
+        for opts in [0, options::FILE_DIRECTORY_FILE] {
+            let lost = open(&d, r"\media\SOUNDS", opts).unwrap();
+            let real = open(&d, r"\empty", opts).unwrap();
+            assert_eq!((lost.is_dir(), lost.size()), (real.is_dir(), real.size()));
+            assert_eq!(lost.facts().attributes, real.facts().attributes);
+            assert_eq!(lost.list(&|_| true), real.list(&|_| true));
+        }
+        let media = open(&d, r"\Media", 0).unwrap();
+        let listed = |name: &str| media.list(&|n| n == name)[0].is_dir;
+        assert!(listed("sounds") && !listed("Dummy.txt"));
+        // ... a missing file under it has its folder ...
+        assert_eq!(
+            open(&d, r"\Media\sounds\a.wav", 0).err(),
+            Some(NtStatus::OBJECT_NAME_NOT_FOUND)
+        );
+        // ... and a file open still opens the empty file.
+        let file = open(&d, r"\Media\sounds", options::FILE_NON_DIRECTORY_FILE).unwrap();
+        assert!(!file.is_dir());
+        // One with an extension is a file.
+        assert_eq!(
+            open(&d, r"\Media\Dummy.txt", options::FILE_DIRECTORY_FILE).err(),
+            Some(NtStatus::NOT_A_DIRECTORY)
+        );
+        assert!(!open(&d, r"\Media\Dummy.txt", 0).unwrap().is_dir());
     }
 
     #[test]

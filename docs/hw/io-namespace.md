@@ -81,8 +81,9 @@ would: `STATUS_OBJECT_NAME_NOT_FOUND` when its parent is `\`, `\??` or
 
 On the disc, in order: no disc mounted, `STATUS_NO_MEDIA_IN_DEVICE`; a
 disposition other than `FILE_OPEN` / `FILE_OPEN_IF`,
-`STATUS_MEDIA_WRITE_PROTECTED`; not found (after trying the English path, see
-below), `STATUS_OBJECT_NAME_NOT_FOUND`; `FILE_DIRECTORY_FILE` on a file,
+`STATUS_MEDIA_WRITE_PROTECTED`; not found, `STATUS_OBJECT_PATH_NOT_FOUND`
+when the folder the name is in is missing or is a file, else
+`STATUS_OBJECT_NAME_NOT_FOUND`; `FILE_DIRECTORY_FILE` on a file,
 `STATUS_NOT_A_DIRECTORY`; `FILE_NON_DIRECTORY_FILE` on a directory,
 `STATUS_FILE_IS_A_DIRECTORY`.
 
@@ -202,7 +203,11 @@ no limit (Riddick's file cache outgrows a 750 MB drive).
 A partition's use is measured by walking its folder, in a background thread:
 all five when the disk is opened, and one again when its files have changed
 and its last measurement is over two seconds old. A query answers with the
-last measurement and waits only for a partition's first.
+last measurement and waits only for a partition's first. Between
+measurements a deleted file's clusters come off the figure at once and a
+format sets it to zero (a measurement begun before the format is dropped):
+a title that trims its cache until the drive reports room asks after each
+delete (Chase: Hollywood Stunt Driver).
 
 ### Raw access
 
@@ -237,11 +242,17 @@ hard disk). The sort key is the start sector too, except for TOCA Race Driver
 relative to `default.xbe`, the title compares that with the key, and a
 rebuilt image gets the pressed disc's sector reported instead.
 
-A path naming a language the disc lacks (`french`, `fre`, `fr` and the like
-as a component or a file name's stem) is retried with English's name in the
-same letter case. `disc_lacks_language` tells the kernel whether to report
-English as the console's language: the disc has an English folder in its
-first three levels but none for the console's language beside one.
+No file stands in for one that is missing, and the console's language is
+reported as set whatever the disc's folders are called: a title on a console
+set to a language its disc lacks finds that language's folder missing and
+chooses for itself, as on the console (Fable falls back to English; Dino
+Crisis 3's European disc names its folders `en`, `fr`, `ge`, `it`, `sp`).
+
+An empty file with no extension in its name is the empty folder an image
+rebuilt from extracted files wrote as a file. It answers as a folder
+(attributes, directory opens, listings, the parent of a missing name); an
+open with `FILE_NON_DIRECTORY_FILE` still opens the empty file. Marvel vs.
+Capcom 2's rebuilt images have `Media\sounds` so.
 
 Reads of `\Device\CdRom0` itself are refused
 (`STATUS_INVALID_DEVICE_REQUEST`), as in the reference, unless the volume
@@ -295,7 +306,8 @@ title sees, with these rules from `io_finish`, which `File::read_pends` and
 (class 1 only). The directory is listed once when an enumeration starts (the
 first call, `RestartScan`, or a mask different from the enumeration's) and
 the enumeration works on that snapshot (XDeleteSaveGame deletes each file as
-it is returned). A call with no mask goes on with the enumeration's mask
+it is returned). The snapshot holds only the entries the mask matches, so a
+lookup of one name does not look every file of a host folder up. A call with no mask goes on with the enumeration's mask
 (Riddick deletes `_filler???` with FindFirstFile / FindNextFile); an empty
 mask is `*`. Matching ignores ASCII case; `*` is any run of characters, `?`
 exactly one, and there are no DOS rules (`*.*` needs a dot).

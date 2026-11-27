@@ -125,6 +125,9 @@ impl Platform for TestPlatform {
     fn set_title_widescreen(&mut self, wide: bool) {
         self.widescreen.push(wide);
     }
+    fn title_shape_known(&mut self) -> bool {
+        !self.widescreen.is_empty()
+    }
     fn phy_link_state(&mut self) -> u32 {
         self.link_state
     }

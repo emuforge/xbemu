@@ -88,6 +88,8 @@ struct Usage {
     used: u64,
     scanned: Option<Instant>,
     generation: u32,
+    /// Formats so far: a scan begun before one does not answer for it.
+    formats: u32,
     valid: bool,
     scanning: bool,
 }
@@ -250,6 +252,20 @@ impl HostDisk {
         lock(&self.inner.usage)[usize::from(part)].scanning = true;
         self.inner.scan(usize::from(part));
         self.inner.part_used(part)
+    }
+
+    /// Where a scan of partition `part` starts from: the disk's generation
+    /// and the partition's formats so far.
+    #[cfg(test)]
+    pub(crate) fn scan_began(&self, part: u8) -> (u32, u32) {
+        let formats = lock(&self.inner.usage)[usize::from(part)].formats;
+        (self.inner.generation.load(Ordering::Relaxed), formats)
+    }
+
+    /// The answer of a scan that started at [`HostDisk::scan_began`]'s.
+    #[cfg(test)]
+    pub(crate) fn scan_answers(&self, part: u8, used: u64, generation: u32, formats: u32) {
+        self.inner.scanned(usize::from(part), used, generation, formats);
     }
 
     /// Refuses creating names FATX does not take
@@ -519,11 +535,69 @@ impl DiskInner {
 
     fn scan(&self, part: usize) {
         let generation = self.generation.load(Ordering::Relaxed);
+        let formats = lock(&self.usage)[part].formats;
         let cluster = u64::from(self.cluster_sectors(part as u8)) * u64::from(HDD_SECTOR);
         let used = usage_of(&self.partition_dir(part as u8), cluster);
+        self.scanned(part, used, generation, formats);
+    }
+
+    /// A scan's answer, begun at `generation` and `formats`. One begun
+    /// before a format is dropped: the format's answer stands
+    /// ([`DiskInner::used_none`]).
+    fn scanned(&self, part: usize, used: u64, generation: u32, formats: u32) {
         let mut usage = lock(&self.usage);
-        usage[part] =
-            Usage { used, scanned: Some(Instant::now()), generation, valid: true, scanning: false };
+        if usage[part].formats == formats {
+            usage[part] = Usage {
+                used,
+                scanned: Some(Instant::now()),
+                generation,
+                formats,
+                valid: true,
+                scanning: false,
+            };
+        } else {
+            usage[part].scanning = false;
+        }
+        self.usage_done.notify_all();
+    }
+
+    /// A file of `size` bytes was deleted from a partition: its clusters
+    /// come off the use at once, not at a later scan's answer, as in the
+    /// reference. A title that trims its cache until the drive reports room
+    /// deletes an entry and asks again (Chase: Hollywood Stunt Driver): with
+    /// the answer from before the deletes it deletes every entry and then
+    /// faults on its empty list.
+    fn used_drop(&self, part: u8, size: u64) {
+        if !(1..=5).contains(&part) {
+            return;
+        }
+        let cluster = u64::from(self.cluster_sectors(part)) * u64::from(HDD_SECTOR);
+        let bytes = size.div_ceil(cluster) * cluster;
+        let mut usage = lock(&self.usage);
+        let u = &mut usage[usize::from(part)];
+        if u.valid {
+            u.used = u.used.saturating_sub(bytes);
+        }
+    }
+
+    /// A partition was formatted: nothing is used, as of now, as in the
+    /// reference. The scan made as the disk was opened saw what another
+    /// title had left on a cache drive, and its answer would go on after
+    /// the format (Chase: Hollywood Stunt Driver, given a drive another
+    /// title had filled, formats it, is told it is full, and finds no entry
+    /// of its own to delete).
+    fn used_none(&self, part: u8) {
+        if !(1..=5).contains(&part) {
+            return;
+        }
+        let mut usage = lock(&self.usage);
+        let u = &mut usage[usize::from(part)];
+        u.used = 0;
+        u.formats = u.formats.wrapping_add(1);
+        u.generation = self.generation.load(Ordering::Relaxed);
+        u.scanned = Some(Instant::now());
+        u.valid = true;
+        // A query waiting for the partition's first scan has its answer.
         self.usage_done.notify_all();
     }
 
@@ -756,9 +830,13 @@ impl Volume for HostVolume {
             log::info!(target: "fs", "delete Partition{}{rel}: at its last close", self.part);
             return NtStatus::SUCCESS;
         }
+        let size = if is_dir { None } else { fs::metadata(&host).ok().map(|m| m.len()) };
         let done = if is_dir { fs::remove_dir(&host) } else { fs::remove_file(&host) };
         match done {
             Ok(()) => {
+                if let Some(size) = size {
+                    disk.used_drop(self.part, size);
+                }
                 log::info!(target: "fs", "delete Partition{}{rel}: done", self.part);
                 NtStatus::SUCCESS
             }
@@ -929,6 +1007,7 @@ impl VolumeFile for HostNode {
                 let host = self.host();
                 log::info!(target: "fs", "Partition{part} formatted ({sectors}-sector clusters): emptied {}", host.display());
                 self.disk.empty_later(&host);
+                self.disk.used_none(part);
             }
             return Ok(data.len());
         }
@@ -1065,12 +1144,13 @@ impl VolumeFile for HostNode {
         self.shared.as_ref().is_some_and(|s| s.delete.load(Ordering::Relaxed))
     }
 
-    fn list(&self) -> Vec<DirEntry> {
+    fn list(&self, keep: &dyn Fn(&str) -> bool) -> Vec<DirEntry> {
         let mut out = Vec::new();
         let Ok(entries) = fs::read_dir(self.host()) else { return out };
         for entry in entries.flatten() {
             let name = name_from_host(&entry.file_name().to_string_lossy());
-            if name.chars().count() >= LISTING_NAME_MAX || out.len() >= LISTING_MAX {
+            if name.chars().count() >= LISTING_NAME_MAX || out.len() >= LISTING_MAX || !keep(&name)
+            {
                 continue;
             }
             let md = fs::metadata(entry.path()).ok();
@@ -1110,7 +1190,13 @@ impl Drop for HostNode {
                 open.remove(&path);
             }
             if shared.delete.load(Ordering::Relaxed) {
-                let _ = fs::remove_file(&path); // the last handle deletes it
+                // The last handle deletes it.
+                let size = fs::metadata(&path).ok().map(|m| m.len());
+                if fs::remove_file(&path).is_ok()
+                    && let Some(size) = size
+                {
+                    self.disk.used_drop(self.part(), size);
+                }
                 self.disk.changed();
             }
         }
@@ -1227,7 +1313,7 @@ impl VolumeFile for RawDiskNode {
         if delete { NtStatus::ACCESS_DENIED } else { NtStatus::SUCCESS }
     }
 
-    fn list(&self) -> Vec<DirEntry> {
+    fn list(&self, _keep: &dyn Fn(&str) -> bool) -> Vec<DirEntry> {
         Vec::new()
     }
 }

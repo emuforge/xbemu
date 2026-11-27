@@ -160,8 +160,7 @@ pub(crate) struct State {
     eeprom: [u8; EEPROM_SIZE],
     /// The stored image (what `eeprom.bin` holds). A title's
     /// ExSaveNonVolatileSetting goes to both; this run's settings (the
-    /// regions of the running title, the English a disc without the language
-    /// gets) never reach the file.
+    /// regions of the running title) never reach the file.
     eeprom_disk: [u8; EEPROM_SIZE],
     eeprom_ready: bool,
     /// The encrypted section, decrypted.
@@ -220,14 +219,17 @@ impl Kernel {
     /// A block of a page or more takes whole pages of its own and gives them
     /// back when freed, as the kernel's pool does (MiAllocatePoolPages): in
     /// the pool, a large temporary buffer grew it for good, and that memory
-    /// never went back to the title (JSRF's stage loads ran out of RAM).
+    /// never went back to the title (JSRF's stage loads ran out of RAM). Its
+    /// pages fill a hole, not the top of the highest free run, so a block
+    /// freed and asked for again comes back where it was (Psi-Ops keeps a
+    /// pointer into its freed text file's block).
     fn ex_pool_alloc(&mut self, size: u32) -> u32 {
         if size > self.gm.ram_size() {
             return 0; // more than there is (and near 4 GiB the sums below wrap)
         }
         if size + POOL_HDR > PAGE_SIZE {
             let len = align_up(size + POOL_HDR, PAGE_SIZE);
-            if let Some(pa) = self.gm.alloc_contig_high(len) {
+            if let Some(pa) = self.gm.alloc_block(len) {
                 let p = CONTIG_WINDOW | pa;
                 self.gm.kfill(p, 0, len);
                 self.gm.kw32(p, size);
@@ -544,16 +546,10 @@ impl Kernel {
         // what an EEPROM kept: one left at surround or mono by another
         // console played that way without a word in the settings.
         wr32(&mut self.ex.eeprom, 0x98, if cfg.surround { 0x0001_0002 } else { 0 });
-        // A disc without the console's language plays in English, as a
-        // console set to it would have the title choose. Its files in
-        // English under the language's name (the I/O fallback) weren't
-        // enough: Fable checked its Spanish folder, found none, and went on
-        // with half of a language loaded until it crashed.
-        let lang = rd32(&self.ex.eeprom, 0x90);
-        if lang >= 2 && self.io_disc_lacks_language(lang) {
-            wr32(&mut self.ex.eeprom, 0x90, 1);
-            log::info!(target: "kernel", "ex: the disc hasn't the console's language ({lang}): English (set the language in the game's settings to keep it)");
-        }
+        // The language stays the console's whatever the disc's folders are
+        // called, as in the reference: a title whose disc lacks it finds
+        // that out from its own files, as on the console (Dino Crisis 3's
+        // European disc names its folders en, fr, ge, it, sp).
         // A disc for North America and Japan both plays as a Japanese
         // console's when the language is Japanese, Korean or Chinese (a
         // console of those markets): Capcom Fighting Evolution's World disc
@@ -1180,6 +1176,12 @@ fn av_set_display_mode(k: &mut Kernel, p: &mut dyn Platform, a: &Args) -> KResul
             frame_buffer: a[5],
             refresh_hz,
         });
+        k.av_title_scan(p, true);
+    } else if a[5] != 0 && !p.title_shape_known() {
+        // No mode (the one set before stays), as the reference has it: Dead
+        // or Alive 3's D3D passes 0 at every call, its parameters (16:9) on
+        // the frames above it all the same. Unscanned, its shape was never
+        // found.
         k.av_title_scan(p, true);
     }
     Ok(0)
@@ -2237,6 +2239,44 @@ mod tests {
         t.k.gm.w32(pp + 44, 75).unwrap();
         t.call("AvSetDisplayMode", &[0, 0, 0x2002_0000, 0x12, 2560, 0]);
         assert!(t.p.widescreen.is_empty());
+    }
+
+    #[test]
+    fn a_call_with_no_mode_but_a_frame_buffer_looks_for_a_shape_not_yet_known() {
+        let mut t = kernel();
+        let pp = t.alloc(0x100);
+        put_present_params(&t, pp, 0x10);
+        // Neither a mode nor a frame buffer: nothing to go by.
+        t.call("AvSetDisplayMode", &[0, 0, 0, 0x12, 2560, 0]);
+        assert!(t.p.widescreen.is_empty());
+        t.call("AvSetDisplayMode", &[0, 0, 0, 0x12, 2560, 0x03C0_0000]);
+        assert_eq!(t.p.widescreen, [true]);
+        assert!(t.p.modes.is_empty(), "no mode was set");
+        // Known, it is not looked for again without a mode.
+        put_present_params(&t, pp, 0);
+        t.call("AvSetDisplayMode", &[0, 0, 0, 0x12, 2560, 0x03C0_0000]);
+        assert_eq!(t.p.widescreen, [true]);
+        // A mode's own scan is the same one.
+        t.call("AvSetDisplayMode", &[0, 0, 0x2002_0000, 0x12, 2560, 0x03C0_0000]);
+        assert_eq!(t.p.widescreen, [true, false]);
+    }
+
+    #[test]
+    fn a_large_pool_block_freed_comes_back_at_its_address_past_smaller_ones() {
+        let mut t = kernel();
+        // A hole of five pages between blocks that stay.
+        let hole = t.call32("ExAllocatePool", &[0x4800]);
+        let stays = t.call32("ExAllocatePool", &[0x1800]);
+        assert!(hole != 0 && stays != 0);
+        t.call("ExFreePool", &[hole]);
+        // The title frees a large block, makes smaller ones and asks for one
+        // of the first's size again.
+        let text = t.call32("ExAllocatePool", &[0x1E_0000]);
+        assert_ne!(text, 0);
+        t.call("ExFreePool", &[text]);
+        let small = [0x3800, 0x1800].map(|size| t.call32("ExAllocatePool", &[size]));
+        assert!(small.iter().all(|&p| p != 0 && p != text));
+        assert_eq!(t.call32("ExAllocatePool", &[0x1E_0000]), text);
     }
 
     #[test]

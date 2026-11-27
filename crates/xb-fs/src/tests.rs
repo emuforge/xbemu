@@ -560,6 +560,88 @@ fn directories_enumerate_with_masks_and_restart() {
 }
 
 #[test]
+fn a_listing_holds_the_entries_its_mask_matches_on_every_volume() {
+    let check = |fs: &FileSystem, dir: &str| {
+        let d = open_dir(fs, dir);
+        let whole = d.list(&|_| true);
+        assert!(whole.len() > 2, "{dir}: {whole:?}");
+        for mask in ["*", "*.xbe", "_filler???", "SUB", "nothing"] {
+            let keep = |name: &str| crate::name::wildcard_match(mask, name);
+            let kept: Vec<_> = whole.iter().filter(|e| keep(&e.name)).cloned().collect();
+            assert_eq!(d.list(&keep), kept, "{dir} {mask}");
+            // The enumeration gives each of them once, numbered as listed.
+            let mut given = Vec::new();
+            let mut restart = true;
+            while let Ok(info) = d.query_directory(Some(mask), restart, 0x200) {
+                assert_eq!(info.file_index as usize, given.len());
+                given.push(info.file_name);
+                restart = false;
+            }
+            assert_eq!(given, kept.iter().map(|e| e.name.clone()).collect::<Vec<_>>());
+        }
+    };
+    on_both("masked", |fs| {
+        let dir = format!(r"{E}\save");
+        mkdir(fs, &dir);
+        for name in ["_filler001", "_filler002", "a.xbe", "b.xbe", "noext"] {
+            put(fs, &format!(r"{dir}\{name}"), b"x");
+        }
+        mkdir(fs, &format!(r"{dir}\sub"));
+        check(fs, &dir);
+    });
+    let fs = mem_fs();
+    fs.insert_disc(Arc::new(disc()));
+    check(&fs, r"\Device\CdRom0");
+}
+
+#[test]
+fn a_saved_enumeration_goes_on_past_the_entries_it_gave() {
+    on_both("saved-enum", |fs| {
+        let dir = format!(r"{E}\save");
+        mkdir(fs, &dir);
+        for name in ["a.sav", "b.txt", "c.sav", "d.txt", "e.sav", "f.sav"] {
+            put(fs, &format!(r"{dir}\{name}"), b"x");
+        }
+        let rest = |d: &File| {
+            let mut out = Vec::new();
+            while let Ok(info) = d.query_directory(None, false, 0x200) {
+                out.push(info.file_name);
+            }
+            out
+        };
+        for given in 0..=4 {
+            let d = open_dir(fs, &dir);
+            let twin = open_dir(fs, &dir);
+            for (i, file) in [&d, &twin].into_iter().enumerate() {
+                for n in 0..given {
+                    file.query_directory(Some("*.sav"), n == 0, 0x200)
+                        .unwrap_or_else(|e| panic!("{i} {n}: {e}"));
+                }
+            }
+            let state = d.saved();
+            // What a state holds counts the folder's whole listing, so it
+            // means the same whatever a listing is narrowed to.
+            let whole = d.list(&|_| true);
+            let passed = &whole[..state.dir_next as usize];
+            assert_eq!(passed.iter().filter(|e| e.name.ends_with(".sav")).count(), given);
+            assert!(passed.last().is_none_or(|e| e.name.ends_with(".sav")));
+            let back = fs.reopen(&state).unwrap();
+            if given == 0 {
+                // Not begun: the next call begins it, as on the file saved.
+                assert_eq!(back.saved(), state);
+                continue;
+            }
+            assert_eq!(rest(&back), rest(&twin), "after {given}");
+            assert_eq!(
+                back.query_directory(None, false, 0x200),
+                Err(NtStatus::NO_MORE_FILES),
+                "after {given}"
+            );
+        }
+    });
+}
+
+#[test]
 fn an_enumeration_works_on_a_snapshot_while_files_are_deleted() {
     on_both("snapshot", |fs| {
         let dir = format!(r"{E}\UDATA");
@@ -887,6 +969,64 @@ fn a_partition_fills_as_its_files_grow() {
     assert_eq!(small.file_bytes(r"\one"), Some(vec![0]));
 }
 
+/// Writes a FATX superblock to a cache partition's device, as
+/// XMountUtilityDrive formats it.
+fn format(fs: &FileSystem, device: &str) {
+    let (part, _) = open(fs, device, RW, CreateDisposition::Open, SYNC).unwrap();
+    let mut superblock = vec![0u8; 4096];
+    superblock[..4].copy_from_slice(b"FATX");
+    superblock[8..12].copy_from_slice(&32u32.to_le_bytes());
+    assert_eq!(part.write(0, &superblock), Ok(4096));
+}
+
+#[test]
+fn a_deleted_file_and_a_format_show_in_the_use_at_once() {
+    let (_dir, fs) = host_fs("usage-drop");
+    let disk = fs.hard_disk().unwrap().clone();
+    for (name, len) in [("one", 1), ("big", 40_000), ("held", 16_385)] {
+        put(&fs, &format!(r"{Z}\{name}"), &vec![0; len]);
+    }
+    // Whole clusters: 1 + 3 + 2. No scan follows: each answer below is the
+    // last scan's, less what went since.
+    let full = disk.rescan_usage(5);
+    assert_eq!(full, 6 * 16384);
+    assert_eq!(fs.delete_file(Root::None, &format!(r"{Z}\big")), NtStatus::SUCCESS);
+    assert_eq!(disk.partition_used(5), full - 3 * 16384);
+    // One deleted with a handle open goes, and is counted off, at its close.
+    let (held, _) =
+        open(&fs, &format!(r"{Z}\held"), RW | access::DELETE, CreateDisposition::Open, SYNC)
+            .unwrap();
+    assert_eq!(held.set_information(file_class::DISPOSITION, &[1]), NtStatus::SUCCESS);
+    assert_eq!(disk.partition_used(5), full - 3 * 16384);
+    drop(held);
+    assert_eq!(disk.partition_used(5), full - 5 * 16384);
+    // The answer is the scan's again once one is made.
+    assert_eq!(disk.rescan_usage(5), disk.partition_used(5));
+
+    put(&fs, &format!(r"{Z}\more"), &[0; 100_000]);
+    assert_ne!(disk.rescan_usage(5), 0);
+    format(&fs, Z);
+    assert_eq!(disk.partition_used(5), 0);
+    assert_eq!(disk.rescan_usage(5), 0);
+}
+
+#[test]
+fn a_scan_begun_before_a_format_does_not_answer_for_the_partition() {
+    let (_dir, fs) = host_fs("usage-stale");
+    let disk = fs.hard_disk().unwrap().clone();
+    put(&fs, &format!(r"{Z}\other-title"), &[0; 100_000]);
+    let seen = disk.rescan_usage(5);
+    assert_ne!(seen, 0);
+    // A scan that began with those files there, answering after the format.
+    let (generation, formats) = disk.scan_began(5);
+    format(&fs, Z);
+    disk.scan_answers(5, seen, generation, formats);
+    assert_eq!(disk.partition_used(5), 0);
+    // One begun after it answers as before.
+    put(&fs, &format!(r"{Z}\mine"), &[0; 1]);
+    assert_eq!(disk.rescan_usage(5), 16384);
+}
+
 #[test]
 fn the_raw_disk_keeps_its_config_sectors() {
     let (dir, fs) = host_fs("raw");
@@ -1083,17 +1223,14 @@ fn the_disc_is_read_only_gdfx() {
         .map(|_| ()),
         Err(NtStatus::NOT_A_DIRECTORY)
     );
-    // A language the disc lacks falls back to English; the handle keeps the title's path.
-    let (voice, _) = open(
-        &fs,
-        r"\Device\CdRom0\sound\spanish\voice.wav",
-        access::GENERIC_READ,
-        CreateDisposition::Open,
-        0,
-    )
-    .unwrap();
-    assert_eq!(voice.size(), 5);
-    assert_eq!(voice.path(), r"\Device\CdRom0\sound\spanish\voice.wav");
+    // A language the disc lacks is a folder that is not there; its file in
+    // another language does not stand in.
+    let miss = |name: &str| {
+        open(&fs, name, access::GENERIC_READ, CreateDisposition::Open, 0).map(|_| ()).unwrap_err()
+    };
+    assert_eq!(miss(r"\Device\CdRom0\sound\spanish\voice.wav"), NtStatus::OBJECT_PATH_NOT_FOUND);
+    assert_eq!(miss(r"\Device\CdRom0\sound\spanish"), NtStatus::OBJECT_NAME_NOT_FOUND);
+    assert_eq!(miss(r"\Device\CdRom0\sound\english\other.wav"), NtStatus::OBJECT_NAME_NOT_FOUND);
 
     // The root, as a directory and as the device.
     let root = open_dir(&fs, r"\??\CDROM0:\");

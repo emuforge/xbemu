@@ -1120,6 +1120,33 @@ impl AddressSpace {
         got.or_else(|| self.alloc_contig_top(phys, mapper, hooks, ContigRequest::anywhere(len)))
             .map(|c| c.pa)
     }
+
+    /// Allocates a kernel block that is freed again (a large pool block):
+    /// the smallest free run that holds it ([`PhysAllocator::alloc`]), below
+    /// [`TOP_RESERVE`] if it can be, else anywhere, else as
+    /// [`AddressSpace::alloc_contig_high`] (virtual pages moved).
+    ///
+    /// Such a block is reached through the contiguous window and never
+    /// moves, so it takes a hole, as page tables do, rather than the top of
+    /// the highest free run, where the next contiguous block goes. As the
+    /// reference does: Psi-Ops frees its 1.9 MiB text file as a new game
+    /// starts, creates threads, and reads the file into a block of the same
+    /// size while it keeps a pointer into the old one. On the console the
+    /// block comes back where it was; with the small blocks made in between
+    /// at the top of its hole it came lower and the title faulted.
+    pub fn alloc_block(
+        &mut self,
+        phys: &mut PhysAllocator,
+        mapper: &mut dyn Mapper,
+        hooks: &mut dyn RelocateHooks,
+        len: u32,
+    ) -> Option<u32> {
+        let ram = phys.ram_size();
+        let below = if ram > TOP_RESERVE { ram - TOP_RESERVE } else { ram };
+        phys.alloc(len, 0, below)
+            .or_else(|| phys.alloc(len, 0, ram))
+            .or_else(|| self.alloc_contig_high(phys, mapper, hooks, len))
+    }
 }
 
 impl std::fmt::Debug for AddressSpace {
@@ -1744,6 +1771,31 @@ mod tests {
             phys.claim(p * P, P);
         }
         assert_eq!(s.alloc_contig_high(&mut phys, &mut m, &mut (), 2 * P), Some(510 * P));
+    }
+
+    #[test]
+    fn a_freed_block_comes_back_where_it_was_when_smaller_ones_have_a_hole_to_fill() {
+        let (mut s, mut m, mut phys) = with_virtual(&[]);
+        let mut block = |phys: &mut PhysAllocator, pages: u32| {
+            s.alloc_block(phys, &mut m, &mut (), pages * P).unwrap()
+        };
+        // A hole of four pages between two blocks that stay.
+        let hole = block(&mut phys, 4);
+        let _stays = block(&mut phys, 1);
+        phys.free(hole, 4 * P);
+        let big = block(&mut phys, 100);
+        assert!(big + 100 * P <= 256 * P, "below the top reserve");
+        phys.free(big, 100 * P);
+        // Smaller blocks made meanwhile take the hole, not the big one's place.
+        let small = [block(&mut phys, 3), block(&mut phys, 1)];
+        assert!(small.iter().all(|&pa| (hole..hole + 4 * P).contains(&pa)), "{small:x?}");
+        assert_eq!(block(&mut phys, 100), big);
+        // With nothing free below the reserve a block goes into it, and with
+        // no free run long enough virtual pages make room.
+        for p in 0..256 {
+            phys.claim(p * P, P);
+        }
+        assert!(block(&mut phys, 2) >= 256 * P);
     }
 
     #[test]

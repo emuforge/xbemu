@@ -346,6 +346,10 @@ impl Platform for MachinePlatform {
         }
     }
 
+    fn title_shape_known(&mut self) -> bool {
+        self.shared.gpu.get().is_some_and(|gpu| gpu.title_wide().is_some())
+    }
+
     fn phy_link_state(&mut self) -> u32 {
         self.dev.borrow().nic.link_state()
     }

@@ -37,7 +37,6 @@ mod tests;
 
 pub use disc::{
     DISC_SECTOR, DISC_TOTAL_SECTORS, DiscNode, DiscTree, DiscVolume, MemDisc, RawBlocks,
-    disc_lacks_language, language_fallback,
 };
 pub use fs::{DeviceRef, File, FileState, FileSystem, OpenError, Root};
 pub use host::{

@@ -470,6 +470,12 @@ impl GuestMem {
         )
     }
 
+    /// A kernel block that is freed again: a hole, not the top of the
+    /// highest free run (`AddressSpace::alloc_block`).
+    pub(crate) fn alloc_block(&mut self, len: u32) -> Option<u32> {
+        self.space.alloc_block(&mut self.phys, &mut self.maps, self.hooks.as_mut(), len)
+    }
+
     /// The kernel's own blocks.
     pub(crate) fn alloc_contig_high(&mut self, len: u32) -> Option<u32> {
         self.space.alloc_contig_high(&mut self.phys, &mut self.maps, self.hooks.as_mut(), len)

@@ -582,7 +582,7 @@ impl VolumeFile for MemNode {
         self.data.as_ref().is_some_and(|d| d.delete.load(Ordering::Relaxed))
     }
 
-    fn list(&self) -> Vec<DirEntry> {
+    fn list(&self, keep: &dyn Fn(&str) -> bool) -> Vec<DirEntry> {
         if self.data.is_some() {
             return Vec::new();
         }
@@ -592,7 +592,7 @@ impl VolumeFile for MemNode {
         let Some(dir) = tree.walk(&path) else { return Vec::new() };
         dir.entries
             .iter()
-            .filter(|(name, _)| name.chars().count() < LISTING_NAME_MAX)
+            .filter(|(name, _)| name.chars().count() < LISTING_NAME_MAX && keep(name))
             .map(|(name, entry)| match entry {
                 MemEntry::Dir(_) => DirEntry { name: name.clone(), size: 0, is_dir: true },
                 MemEntry::File(f) => DirEntry {

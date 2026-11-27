@@ -175,8 +175,12 @@ pub trait VolumeFile: Send + Sync {
         false
     }
 
-    /// A snapshot of a directory's entries, in the volume's order.
-    fn list(&self) -> Vec<DirEntry>;
+    /// A snapshot of those of a directory's entries whose names `keep`
+    /// takes, in the volume's order. Only the kept ones are looked up, so a
+    /// listing for one name does not cost a lookup of every file of a host
+    /// folder (Armed and Dangerous looks each sound of a level up by name in
+    /// its cache partition as the level loads).
+    fn list(&self, keep: &dyn Fn(&str) -> bool) -> Vec<DirEntry>;
 
     /// Data or size changed through this handle.
     fn wrote(&self) -> bool {
