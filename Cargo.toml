@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*"]
+exclude = ["vendor"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/emuforge/xbemu"
+homepage = "https://docs.xbemu.org"
+# Released as binaries from GitHub, not as crates.
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+debug = "line-tables-only"
+panic = "abort"
+
+# The PulseAudio client cpal's host uses, with one change to its socket read
+# (vendor/pulseaudio/PATCHES.md).
+[patch.crates-io]
+pulseaudio = { path = "vendor/pulseaudio" }

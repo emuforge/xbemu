@@ -1,0 +1,8 @@
+# Build output, and the third-party sources tools/fetch-deps.sh fetches.
+/target/
+/third_party/
+# A developer's own notes, reference clones and measurements.
+/local/
+# Logs and frame dumps of runs.
+*.log
+/frames/

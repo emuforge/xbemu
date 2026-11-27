@@ -1,0 +1,11 @@
+# `cargo release-build` is the release binary as it is shipped: `cargo build
+# --release -p xbemu` with, on x86-64 Linux, the Rust compiled for the
+# linker's LTO too, so the linker inlines between the Rust and the vendored
+# C (which is bitcode in a release build already, `crates/xb-gpu/build.rs`).
+# Kept out of plain builds and tests, whose every link it would slow;
+# `./xbemu` and `tools/docker-build.sh` build the same.
+[alias]
+release-build = [
+    "build", "--release", "-p", "xbemu",
+    "--config", "target.x86_64-unknown-linux-gnu.rustflags=['-Clinker-plugin-lto']",
+]
