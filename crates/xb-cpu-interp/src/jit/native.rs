@@ -118,7 +118,9 @@ impl Off {
             .into_iter()
             .all(word)
             && self.op < 4096
-            && [self.helpers, self.tables].into_iter().all(|v| v.is_multiple_of(8) && v + 24 < 32768)
+            && [self.helpers, self.tables]
+                .into_iter()
+                .all(|v| v.is_multiple_of(8) && v + 24 < 32768)
     }
 }
 

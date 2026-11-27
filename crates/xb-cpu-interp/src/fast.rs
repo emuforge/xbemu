@@ -813,53 +813,53 @@ pub(crate) mod tests {
         &[0x70, 0x05],                               // jo
         &[0x0F, 0x8F, 0x00, 0x01, 0x00, 0x00],       // jg near
         &[0x64, 0x8B, 0x05, 0x20, 0x00, 0x00, 0x00], // mov eax,fs:[0x20]
-        &[0xD9, 0x03], // fld dword [ebx]
-        &[0xDD, 0x03], // fld qword [ebx]
-        &[0xD9, 0xC2], // fld st(2)
-        &[0xD9, 0x13], // fst dword [ebx]
-        &[0xD9, 0x1B], // fstp dword [ebx]
-        &[0xDD, 0x13], // fst qword [ebx]
-        &[0xDD, 0x1B], // fstp qword [ebx]
-        &[0xDD, 0xD2], // fst st(2)
-        &[0xDD, 0xDA], // fstp st(2)
-        &[0xD8, 0x03], // fadd dword [ebx]
-        &[0xD8, 0x0B], // fmul dword [ebx]
-        &[0xD8, 0x23], // fsub dword [ebx]
-        &[0xD8, 0x2B], // fsubr dword [ebx]
-        &[0xD8, 0x33], // fdiv dword [ebx]
-        &[0xD8, 0x3B], // fdivr dword [ebx]
-        &[0xDC, 0x03], // fadd qword [ebx]
-        &[0xDC, 0x0B], // fmul qword [ebx]
-        &[0xDC, 0x33], // fdiv qword [ebx]
-        &[0xD8, 0xC1], // fadd st,st(1)
-        &[0xD8, 0xCA], // fmul st,st(2)
-        &[0xD8, 0xE1], // fsub st,st(1)
-        &[0xD8, 0xE9], // fsubr st,st(1)
-        &[0xD8, 0xF1], // fdiv st,st(1)
-        &[0xD8, 0xF9], // fdivr st,st(1)
-        &[0xDC, 0xC1], // fadd st(1),st
-        &[0xDC, 0xC9], // fmul st(1),st
-        &[0xDC, 0xE1], // fsubr st(1),st
-        &[0xDC, 0xE9], // fsub st(1),st
-        &[0xDC, 0xF1], // fdivr st(1),st
-        &[0xDC, 0xF9], // fdiv st(1),st
-        &[0xDE, 0xC1], // faddp st(1),st
-        &[0xDE, 0xC9], // fmulp st(1),st
-        &[0xDE, 0xE1], // fsubrp st(1),st
-        &[0xDE, 0xE9], // fsubp st(1),st
-        &[0xDE, 0xF1], // fdivrp st(1),st
-        &[0xDE, 0xF9], // fdivp st(1),st
-        &[0xD8, 0x13], // fcom dword [ebx]
-        &[0xD8, 0x1B], // fcomp dword [ebx]
-        &[0xDC, 0x13], // fcom qword [ebx]
-        &[0xDC, 0x1B], // fcomp qword [ebx]
-        &[0xD8, 0xD1], // fcom st(1)
-        &[0xD8, 0xD9], // fcomp st(1)
-        &[0xDD, 0xE1], // fucom st(1)
-        &[0xDD, 0xE9], // fucomp st(1)
-        &[0xDF, 0xE0], // fnstsw ax
-        &[0xDB, 0x03], // fild dword [ebx]
-        &[0xD9, 0xC9], // fxch st(1)
+        &[0xD9, 0x03],                               // fld dword [ebx]
+        &[0xDD, 0x03],                               // fld qword [ebx]
+        &[0xD9, 0xC2],                               // fld st(2)
+        &[0xD9, 0x13],                               // fst dword [ebx]
+        &[0xD9, 0x1B],                               // fstp dword [ebx]
+        &[0xDD, 0x13],                               // fst qword [ebx]
+        &[0xDD, 0x1B],                               // fstp qword [ebx]
+        &[0xDD, 0xD2],                               // fst st(2)
+        &[0xDD, 0xDA],                               // fstp st(2)
+        &[0xD8, 0x03],                               // fadd dword [ebx]
+        &[0xD8, 0x0B],                               // fmul dword [ebx]
+        &[0xD8, 0x23],                               // fsub dword [ebx]
+        &[0xD8, 0x2B],                               // fsubr dword [ebx]
+        &[0xD8, 0x33],                               // fdiv dword [ebx]
+        &[0xD8, 0x3B],                               // fdivr dword [ebx]
+        &[0xDC, 0x03],                               // fadd qword [ebx]
+        &[0xDC, 0x0B],                               // fmul qword [ebx]
+        &[0xDC, 0x33],                               // fdiv qword [ebx]
+        &[0xD8, 0xC1],                               // fadd st,st(1)
+        &[0xD8, 0xCA],                               // fmul st,st(2)
+        &[0xD8, 0xE1],                               // fsub st,st(1)
+        &[0xD8, 0xE9],                               // fsubr st,st(1)
+        &[0xD8, 0xF1],                               // fdiv st,st(1)
+        &[0xD8, 0xF9],                               // fdivr st,st(1)
+        &[0xDC, 0xC1],                               // fadd st(1),st
+        &[0xDC, 0xC9],                               // fmul st(1),st
+        &[0xDC, 0xE1],                               // fsubr st(1),st
+        &[0xDC, 0xE9],                               // fsub st(1),st
+        &[0xDC, 0xF1],                               // fdivr st(1),st
+        &[0xDC, 0xF9],                               // fdiv st(1),st
+        &[0xDE, 0xC1],                               // faddp st(1),st
+        &[0xDE, 0xC9],                               // fmulp st(1),st
+        &[0xDE, 0xE1],                               // fsubrp st(1),st
+        &[0xDE, 0xE9],                               // fsubp st(1),st
+        &[0xDE, 0xF1],                               // fdivrp st(1),st
+        &[0xDE, 0xF9],                               // fdivp st(1),st
+        &[0xD8, 0x13],                               // fcom dword [ebx]
+        &[0xD8, 0x1B],                               // fcomp dword [ebx]
+        &[0xDC, 0x13],                               // fcom qword [ebx]
+        &[0xDC, 0x1B],                               // fcomp qword [ebx]
+        &[0xD8, 0xD1],                               // fcom st(1)
+        &[0xD8, 0xD9],                               // fcomp st(1)
+        &[0xDD, 0xE1],                               // fucom st(1)
+        &[0xDD, 0xE9],                               // fucomp st(1)
+        &[0xDF, 0xE0],                               // fnstsw ax
+        &[0xDB, 0x03],                               // fild dword [ebx]
+        &[0xD9, 0xC9],                               // fxch st(1)
         &[0x13, 0xC1],                               // adc eax,ecx (general path)
         &[0x66, 0x8B, 0x03],                         // mov ax,[ebx] (general path)
     ];

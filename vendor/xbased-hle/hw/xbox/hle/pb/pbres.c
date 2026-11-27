@@ -533,8 +533,8 @@ enum {
 };
 #if defined(XBEMU_HOST) && defined(__APPLE__)
 /* xbemu: Metal has no triangle fans, and MoltenVK's emulation of them draws
- * only a fan's first triangle (Halo's intro movie, a full-screen fan, showed
- * half a picture). Fans and polygons are drawn as triangle lists instead. */
+ * only a fan's first triangle (Halo's intro movie, one full-screen fan, is
+ * cut along its diagonal). Fans and polygons are drawn as triangle lists. */
 #define FANS_AS_LISTS 1
 #endif
 

@@ -1,0 +1,91 @@
+name: Build (macOS)
+
+# The macOS release build and its disk image, uploaded as the artifact
+# dist-macos-<arch>. Called by ci.yaml (docs/releasing.md).
+#
+# Built on the runner itself rather than in a container: macOS has none.
+# The toolchain is rust-toolchain.toml's, which rustup installs on first
+# use; MoltenVK, which the app carries, is Homebrew's.
+
+on:
+  workflow_call:
+    inputs:
+      arch:
+        description: The architecture, arm64
+        type: string
+        default: arm64
+      label:
+        description: What the files are named by, a commit's short hash or a version
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ inputs.arch }}
+    # Apple silicon
+    runs-on: macos-15
+    env:
+      # The oldest macOS the build asks for; Homebrew's MoltenVK needs 12
+      # too, and tools/package-macos.sh writes the newer of the two into
+      # the app.
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install MoltenVK and the C build's tools
+        run: |
+          set -eu
+          brew install molten-vk ninja
+          brew list --versions molten-vk
+
+      # The crates and the third-party sources, not the build's own output:
+      # a release is built from nothing
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            third_party
+          key: build-sources-macos-${{ hashFiles('Cargo.lock', 'tools/fetch-deps.sh') }}
+
+      - name: Fetch the third-party sources
+        run: tools/fetch-deps.sh
+
+      - name: Build
+        env:
+          XBEMU_BUILD_COMMIT: ${{ inputs.label }}
+        run: cargo release-build --locked
+
+      - name: Package
+        env:
+          LABEL: ${{ inputs.label }}
+        run: tools/package-macos.sh target/release/xbemu dist "${LABEL}"
+
+      # The app on the disk image has to start and report what it was built
+      # from. (The runner has no display to run a title on.)
+      - name: Start the packaged app
+        env:
+          LABEL: ${{ inputs.label }}
+        run: |
+          set -eu
+          dmg="dist/xbemu-${LABEL}-${{ inputs.arch }}-macos.dmg"
+          mount=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "${mount}" "${dmg}"
+          trap 'hdiutil detach -quiet "${mount}"' EXIT
+          codesign --verify --deep --strict "${mount}/xbemu.app"
+          test -f "${mount}/xbemu.app/Contents/Frameworks/libMoltenVK.dylib"
+          "${mount}/xbemu.app/Contents/MacOS/xbemu" --version | tee version.txt
+          grep -q "(${LABEL})" version.txt \
+            || { echo "::error::the app does not report ${LABEL}"; exit 1; }
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-macos-${{ inputs.arch }}
+          path: dist/*.dmg
+          if-no-files-found: error
+          retention-days: 7

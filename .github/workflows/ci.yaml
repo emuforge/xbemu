@@ -107,10 +107,18 @@ jobs:
       libc: glibc
       label: ${{ needs.label.outputs.short }}
 
+  macos-arm64:
+    name: macOS
+    needs: label
+    uses: ./.github/workflows/build-macos.yaml
+    with:
+      arch: arm64
+      label: ${{ needs.label.outputs.short }}
+
   pre-release:
     name: Publish the pre-release
     # Every platform's build joins `needs` and the check below
-    needs: [label, checks, licenses, linux-glibc-x86_64]
+    needs: [label, checks, licenses, linux-glibc-x86_64, macos-arm64]
     if: github.repository == 'emuforge/xbemu' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -130,7 +138,7 @@ jobs:
           cd pre-release
           # Every kind of file, so a build that uploaded nothing fails here
           # rather than publishing a pre-release without it
-          for want in '*-x86_64-linux-glibc.tar.gz' '*-x86_64-linux-glibc.AppImage'; do
+          for want in '*-x86_64-linux-glibc.tar.gz' '*-x86_64-linux-glibc.AppImage' '*-arm64-macos.dmg'; do
             # shellcheck disable=SC2086  # want is the glob expanded here
             ls ${want} > /dev/null 2>&1 || { echo "::error::no ${want} in the run's artifacts"; exit 1; }
           done

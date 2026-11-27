@@ -365,9 +365,9 @@ function tables).
   are converted call `hle_draw_prim_converted` instead of listing them.
 
 Why: Metal has no triangle fans, and MoltenVK's emulation of them draws
-only a fan's first triangle. Halo's intro movie, drawn as one full-screen
-fan, showed half a picture cut along the diagonal; as a triangle list it is
-whole. Other hosts keep the fan topology.
+only a fan's first triangle: Halo's intro movie, one full-screen fan, is cut
+along the diagonal that way and whole as a triangle list. Other hosts keep
+the fan topology.
 
 ## 20. MoltenVK as the reference's macOS build runs it
 

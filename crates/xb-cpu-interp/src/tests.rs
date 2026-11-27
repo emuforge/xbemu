@@ -173,8 +173,15 @@ mod compiled {
         const EDGES: [u32; 7] = [0, 1, 2, 0x7FFF_FFFF, 0x8000_0000, 0x8000_0001, 0xFFFF_FFFF];
         // cmp eax,ecx; test eax,ecx; sub eax,ecx; and eax,ecx; add eax,ecx;
         // cmp eax,5; cmp eax,[ebx]
-        let firsts: [&[u8]; 7] =
-            [&[0x3B, 0xC1], &[0x85, 0xC1], &[0x2B, 0xC1], &[0x23, 0xC1], &[0x03, 0xC1], &[0x83, 0xF8, 0x05], &[0x3B, 0x03]];
+        let firsts: [&[u8]; 7] = [
+            &[0x3B, 0xC1],
+            &[0x85, 0xC1],
+            &[0x2B, 0xC1],
+            &[0x23, 0xC1],
+            &[0x03, 0xC1],
+            &[0x83, 0xF8, 0x05],
+            &[0x3B, 0x03],
+        ];
         for first in firsts {
             for cc in 0..16u8 {
                 let mut bytes = first.to_vec();
@@ -209,7 +216,12 @@ mod compiled {
                     assert!(
                         want == got,
                         "{bytes:02x?} with eax {:#x} ecx {:#x}: interpreted ends at {:#x} flags {:#x}, compiled at {:#x} flags {:#x}",
-                        gpr[0], gpr[1], want.2, want.3, got.2, got.3
+                        gpr[0],
+                        gpr[1],
+                        want.2,
+                        want.3,
+                        got.2,
+                        got.3
                     );
                 }
             }

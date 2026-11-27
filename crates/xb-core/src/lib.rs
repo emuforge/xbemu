@@ -53,11 +53,11 @@ pub use state::{StateInfo, info as state_info};
 pub use xb_apu::{
     AudioSink, Channels, DrainSignal, NullSink, RingSink, RingSource, StreamSpec, ring_sink,
 };
-pub use xb_gpu::{DrawStats, SurfaceProvider, VkInstance, VkSurfaceKHR};
 /// Where the renderer looks for the Vulkan library on macOS; a front end
 /// that creates the window's surface itself looks in the same order.
 #[cfg(target_os = "macos")]
 pub use xb_gpu::vulkan_libraries;
+pub use xb_gpu::{DrawStats, SurfaceProvider, VkInstance, VkSurfaceKHR};
 pub use xb_types::pad::{self, PORTS, PadState, Rumble};
 pub use xb_types::settings::{Aspect, CpuBackend, Settings};
 

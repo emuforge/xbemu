@@ -130,15 +130,18 @@ pub use imp::{monotonic_ns, sleep_until_ns};
 #[must_use]
 pub fn vulkan_libraries() -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
-    if let Some(contents) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().and_then(std::path::Path::parent).map(std::path::Path::to_path_buf))
-    {
+    if let Some(contents) = std::env::current_exe().ok().and_then(|exe| {
+        exe.parent().and_then(std::path::Path::parent).map(std::path::Path::to_path_buf)
+    }) {
         paths.push(contents.join("Frameworks/libMoltenVK.dylib"));
     }
     paths.extend(
-        ["libvulkan.1.dylib", "/opt/homebrew/lib/libvulkan.1.dylib", "/usr/local/lib/libvulkan.1.dylib"]
-            .map(std::path::PathBuf::from),
+        [
+            "libvulkan.1.dylib",
+            "/opt/homebrew/lib/libvulkan.1.dylib",
+            "/usr/local/lib/libvulkan.1.dylib",
+        ]
+        .map(std::path::PathBuf::from),
     );
     paths
 }

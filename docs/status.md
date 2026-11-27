@@ -4,7 +4,7 @@ What works today and what does not. `ROADMAP.md` says where the project is
 going.
 
 xbemu is early. Linux x86-64 is the first platform; macOS on Apple silicon
-builds and runs a title through MoltenVK, not yet at full speed everywhere.
+runs titles through MoltenVK.
 A handful of titles have been run.
 
 ## What works
@@ -14,7 +14,7 @@ A handful of titles have been run.
 | Disc images | CCI (single files and split sets), XISO and raw images; XDVDFS; XBE executables |
 | CPU: KVM backend | working; used when the host has `/dev/kvm` |
 | CPU: x86-64 translator | working; always available, less tested than KVM |
-| CPU: interpreter | working; the backend of hosts without the other two (macOS on Apple silicon), where hot blocks are compiled to AArch64 code. Slower than the other backends: a title's heavier scenes do not reach full speed |
+| CPU: interpreter | working; the backend of hosts without the other two (macOS on Apple silicon), where hot blocks are compiled to AArch64 code |
 | Kernel (HLE) | 219 exports implemented, 36 stand-ins, 82 unimplemented, which stop the guest with a clear message (`docs/hw/kernel-exports.md`) |
 | GPU | the vendored C renderer on Vulkan, behind a Rust register front end; render scale up to 4x. On macOS through MoltenVK, which lacks point-mode polygons, sampler LOD bias and wide lines |
 | Audio | the vendored C APU, 48 kHz stereo output |

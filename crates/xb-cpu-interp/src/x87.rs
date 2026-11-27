@@ -15,8 +15,8 @@ use iced_x86::{Instruction, Mnemonic as M, OpKind, Register};
 use xb_cpu::Bus;
 
 use crate::cpu::{Flow, InterpCpu, Step, Stop};
-use crate::fast::{Handler, Uop, ea_of};
 use crate::f80::{F80, Fpr, Round, round_f64};
+use crate::fast::{Handler, Uop, ea_of};
 use crate::flags::{ARITH, CF, PF, ZF};
 
 /// Status word bits.

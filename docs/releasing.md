@@ -12,6 +12,7 @@ commit's message. Its files:
 |---|---|
 | `xbemu-<commit>-x86_64-linux-glibc.AppImage` | the standalone app as one file: make it executable and run it |
 | `xbemu-<commit>-x86_64-linux-glibc.tar.gz` | the same binary in a folder, with the licenses |
+| `xbemu-<commit>-arm64-macos.dmg` | the macOS app for Apple silicon: open it and drag `xbemu.app` to Applications |
 | `SHA256SUMS` | the checksums of the above |
 
 Each file carries a build provenance attestation: `gh attestation verify
@@ -41,12 +42,38 @@ the build supports, so that nothing newer can be linked by accident;
 `tools/docker-build.sh` makes the same files locally, into
 `target/docker/dist`.
 
+## The macOS build
+
+`xbemu.app` runs on Apple silicon with macOS 12 or newer. It carries
+MoltenVK (Vulkan on Metal) in `Contents/Frameworks`, so nothing else needs
+installing; the renderer finds it there before any Vulkan loader on the
+system. Started from the Finder or the Dock, the app asks for a disc image
+with the system's Open panel; from a terminal it takes the same arguments as
+on Linux (`xbemu.app/Contents/MacOS/xbemu game.iso`, or `open -a xbemu
+--args game.iso`).
+
+The build runs on a macOS runner, not in a container: Homebrew's
+`molten-vk`, the release build with `MACOSX_DEPLOYMENT_TARGET` 12.0, then
+`tools/package-macos.sh`, which writes into the app the newer of the binary's
+and MoltenVK's minimum macOS versions, refuses a MoltenVK that needs
+anything but the system, and makes the disk image. The same script makes a
+disk image locally from any release binary.
+
+A pre-release is signed ad hoc, not by a developer: macOS keeps a copy
+downloaded from the web from opening until it is allowed once, in System
+Settings > Privacy & Security ("Open Anyway"), or with `xattr -dr
+com.apple.quarantine /Applications/xbemu.app`. A release signed with a
+Developer ID and notarized needs the hardened runtime and
+`packaging/macos/xbemu.entitlements`, which lets the CPU backend generate
+code.
+
 ## Workflows
 
 | Workflow | Runs on | Does |
 |---|---|---|
-| `ci.yaml` | pull requests, pushes to `main` | formatting, clippy, the tests, the license check, the Linux build; on `main`, the pre-release |
+| `ci.yaml` | pull requests, pushes to `main` | formatting, clippy, the tests, the license check, the Linux and macOS builds; on `main`, the pre-release |
 | `build-linux.yaml` | called by `ci.yaml` | one Linux target's build and packages, as an artifact; checked by starting it on a bare system at the glibc floor |
+| `build-macos.yaml` | called by `ci.yaml` | the macOS build and disk image on a macOS runner, as an artifact; checked by starting the app from the disk image |
 | `docs.yaml` | pull requests, pushes to `main` | builds this site and the rustdoc; on `main`, publishes them to <https://docs.xbemu.org> |
 
 The checks and the build run inside the toolchain container

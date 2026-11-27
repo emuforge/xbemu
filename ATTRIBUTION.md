@@ -44,3 +44,9 @@ Each vendored directory has a `README.md` naming its source revision and a
 
 Third-party libraries fetched at build time by `tools/fetch-deps.sh` and Rust
 crates from crates.io keep their own licenses; all are GPLv3-compatible.
+
+## Shipped beside the binary
+
+| What | Where | License |
+|---|---|---|
+| [MoltenVK](https://github.com/KhronosGroup/MoltenVK) (Vulkan on Metal), Homebrew's build | `xbemu.app/Contents/Frameworks` in the macOS app, its license in `Contents/Resources/licenses` | Apache-2.0 |

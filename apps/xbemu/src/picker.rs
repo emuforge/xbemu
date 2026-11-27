@@ -7,6 +7,10 @@
 use std::path::PathBuf;
 
 /// What the person chose.
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(dead_code, reason = "only the macOS Open panel chooses a disc or is cancelled")
+)]
 pub enum Choice {
     /// This disc image.
     Disc(PathBuf),
@@ -34,7 +38,9 @@ mod macos {
     //! The AppKit Open panel.
 
     use objc2::MainThreadMarker;
-    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSModalResponseOK, NSOpenPanel};
+    use objc2_app_kit::{
+        NSApplication, NSApplicationActivationPolicy, NSModalResponseOK, NSOpenPanel,
+    };
     use objc2_foundation::NSString;
 
     use super::Choice;
@@ -53,7 +59,9 @@ mod macos {
         panel.setCanChooseFiles(true);
         panel.setCanChooseDirectories(false);
         panel.setAllowsMultipleSelection(false);
-        panel.setMessage(Some(&NSString::from_str("Choose a disc image (.iso, .xiso or .cci) to play")));
+        panel.setMessage(Some(&NSString::from_str(
+            "Choose a disc image (.iso, .xiso or .cci) to play",
+        )));
         if panel.runModal() != NSModalResponseOK {
             return Choice::Cancelled;
         }

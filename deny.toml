@@ -6,7 +6,7 @@
 # accounted for in ATTRIBUTION.md.
 
 [graph]
-targets = ["x86_64-unknown-linux-gnu"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 # Dev-dependencies build the tests only and ship in nothing.
 exclude-dev = true
 
