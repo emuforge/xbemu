@@ -181,7 +181,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Those are the checks before a change is done, and what CI runs. Most tests
+Before a commit, `tools/check.sh` runs everything CI checks, in its order:
+those three (formatting as `--check`), `cargo deny check`, and
+`tools/build-docs.sh`, whose rustdoc treats warnings as errors. A doc link
+to an item that exists on one platform only, such as a `cfg(target_os =
+"macos")` module, is broken on the others and fails the docs build: name it
+in plain code (`` `macos` ``) rather than as a link. Most tests
 need nothing but the toolchain. Some need more and say so in a printed note
 when they pass without checking anything:
 

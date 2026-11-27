@@ -177,6 +177,12 @@ to TRACE. Each crate logs under a short target: `disc`, `fs`, `cpu`, `mem`,
   or was not tried, or the story of how a fix was found. Measurements taken
   while working stay out unless a decision rests on one, and then the
   decision carries it.
+- **Before every commit, `tools/check.sh` MUST pass.** It runs what CI runs:
+  formatting, clippy, the tests, `cargo deny`, and the docs site with its
+  rustdoc, where warnings are errors. A commit is not made on a subset of
+  it. A change to macOS-only code is checked on a Mac too, since Linux does
+  not compile it; a doc link to an item one platform lacks is written as
+  plain code, not a link.
 - Report which checks ran and which did not. A check that did not run is never
   reported as passed.
 - When several agents work at once, each stays inside its own crate. Shared

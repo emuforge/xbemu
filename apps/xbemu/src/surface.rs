@@ -10,7 +10,7 @@
 //! main thread, and `winit` hands out the window's handle only there, while
 //! the renderer asks for the surface on its presenting thread. The window's
 //! CAMetalLayer is therefore made when the window is handed over (on the
-//! main thread, [`macos`]), and the surface is made from the layer, which
+//! main thread, in the `macos` module), and the surface is made from the layer, which
 //! `VK_EXT_metal_surface` allows from any thread.
 //!
 //! This is the one module of the app with `unsafe`: Vulkan calls and the
