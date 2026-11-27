@@ -1,0 +1,94 @@
+name: Build (Linux)
+
+# One Linux target's release build and its packages, uploaded as the artifact
+# dist-linux-<libc>-<arch>. Called by ci.yaml; a platform of its own gets a
+# workflow of its own beside this one (docs/releasing.md).
+
+on:
+  workflow_call:
+    inputs:
+      arch:
+        description: The architecture, x86_64
+        type: string
+        default: x86_64
+      libc:
+        description: The C library, glibc
+        type: string
+        default: glibc
+      label:
+        description: What the files are named by, a commit's short hash or a version
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ inputs.arch }}, ${{ inputs.libc }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read the toolchain's version
+        id: rust
+        run: echo "toolchain=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "${GITHUB_OUTPUT}"
+
+      # The toolchain image, rebuilt only when docker/ changes
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: docker
+          build-args: RUST_TOOLCHAIN=${{ steps.rust.outputs.toolchain }}
+          tags: xbemu-build:ci
+          load: true
+          cache-from: type=gha,scope=toolchain-${{ inputs.libc }}-${{ inputs.arch }}
+          cache-to: type=gha,mode=max,scope=toolchain-${{ inputs.libc }}-${{ inputs.arch }}
+
+      # The crates and the third-party sources, not the build's own output:
+      # a release is built from nothing
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/docker/cargo-home/registry
+            target/docker/cargo-home/git
+            target/docker/deps
+          key: build-sources-${{ hashFiles('Cargo.lock', 'tools/fetch-deps.sh') }}
+
+      - name: Build and package
+        env:
+          XBEMU_BUILD_IMAGE: xbemu-build:ci
+          XBEMU_BUILD_COMMIT: ${{ inputs.label }}
+        run: tools/docker-build.sh
+
+      # On systems with nothing installed but what the binary links, the
+      # oldest the build supports among them: both packages have to start
+      - name: Start both packages on bare systems
+        env:
+          LABEL: ${{ inputs.label }}
+        run: |
+          set -eu
+          name="xbemu-${LABEL}-${{ inputs.arch }}-linux-${{ inputs.libc }}"
+          for host in almalinux:8 debian:stable-slim; do
+            case "${host}" in
+              almalinux:*) deps='dnf install -y -q alsa-lib systemd-libs > /dev/null' ;;
+              *) deps='apt-get update -qq && apt-get install -y -qq libasound2 libudev1 > /dev/null' ;;
+            esac
+            docker run --rm -v "${PWD}/target/docker/dist:/dist:ro" -e NAME="${name}" "${host}" sh -euc "
+              ${deps}
+              tar -xzf /dist/\${NAME}.tar.gz -C /tmp
+              /tmp/\${NAME}/xbemu --version
+              /dist/\${NAME}.AppImage --appimage-extract-and-run --version
+            " | tee "version-${host%%:*}.txt"
+            grep -q "(${LABEL})" "version-${host%%:*}.txt" \
+              || { echo "::error::the build on ${host} does not report ${LABEL}"; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-linux-${{ inputs.libc }}-${{ inputs.arch }}
+          path: target/docker/dist/*
+          if-no-files-found: error
+          retention-days: 7

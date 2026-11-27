@@ -1,0 +1,92 @@
+name: Docs
+
+# The documentation site and the developer reference (rustdoc), built on
+# every pull request and published from main to docs.xbemu.org.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  pull_request:
+
+# A newer push to the same ref supersedes its build; the one Pages site takes
+# deployments in turn, in the publish job.
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  MDBOOK_VERSION: "0.5.4"
+
+jobs:
+  build:
+    name: Build documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read the toolchain's version
+        id: rust
+        run: echo "toolchain=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "${GITHUB_OUTPUT}"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: docker
+          build-args: RUST_TOOLCHAIN=${{ steps.rust.outputs.toolchain }}
+          tags: xbemu-build:ci
+          load: true
+          cache-from: type=gha,scope=toolchain-glibc-x86_64
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/docker
+            !target/docker/dist
+          key: docs-${{ steps.rust.outputs.toolchain }}-${{ hashFiles('Cargo.lock', 'tools/fetch-deps.sh', 'docker/Dockerfile') }}-${{ github.sha }}
+          restore-keys: |
+            docs-${{ steps.rust.outputs.toolchain }}-${{ hashFiles('Cargo.lock', 'tools/fetch-deps.sh', 'docker/Dockerfile') }}-
+
+      # rustdoc type-checks the workspace, whose build scripts compile the
+      # vendored C, so it runs where the build does
+      - name: Build the site and the developer reference
+        env:
+          XBEMU_BUILD_IMAGE: xbemu-build:ci
+        run: |
+          tools/in-container.sh bash -euo pipefail -c '
+            tools/fetch-deps.sh
+            cargo install --locked --quiet --version "'"${MDBOOK_VERSION}"'" mdbook
+            tools/build-docs.sh
+          '
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: target/site
+          retention-days: 1
+
+  publish:
+    name: Publish documentation
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # deploy-pages resolves the artifact through the Actions API
+      actions: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    if: ${{ github.repository == 'emuforge/xbemu' && github.ref == 'refs/heads/main' }}
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
