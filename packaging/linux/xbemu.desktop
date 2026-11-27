@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=xbemu
+Comment=Original Xbox emulator
+Exec=xbemu %f
+Icon=xbemu
+Terminal=false
+Categories=Game;Emulator;
