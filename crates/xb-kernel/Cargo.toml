@@ -1,0 +1,28 @@
+[package]
+name = "xb-kernel"
+description = "High-level reimplementation of the Xbox kernel (xboxkrnl.exe exports)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+xb-types = { path = "../xb-types" }
+xb-cpu = { path = "../xb-cpu" }
+xb-mem = { path = "../xb-mem" }
+xb-formats = { path = "../xb-formats" }
+xb-fs = { path = "../xb-fs" }
+log = "0.4.29"
+
+[dev-dependencies]
+# The titles stash: finds the game images a developer has linked in.
+xb-testkit = { path = "../xb-testkit" }
+# Tests only: guest programs run under the real kernel on hardware
+# virtualization (a same-layer crate, allowed for cross-checking).
+xb-cpu-kvm = { path = "../xb-cpu-kvm" }
