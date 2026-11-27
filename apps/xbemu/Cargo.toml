@@ -24,7 +24,7 @@ cpal = "0.18.2"
 # MIT OR Apache-2.0 (already in the tree through ash-window). The window's
 # CAMetalLayer, made on the main thread as AppKit requires (surface.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
-raw-window-metal = "0.4.0"
+raw-window-metal = "1.1.0"
 # MIT. The Open panel that asks for a disc when the app is started without
 # one (picker.rs); version 0.3 of the bindings winit uses, whose panel calls
 # are safe.
