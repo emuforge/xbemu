@@ -130,6 +130,10 @@ struct DiskInner {
     next_id: AtomicU64,
     enforce_fatx: AtomicBool,
     mismatch_logged: AtomicU32,
+    /// The host's file system ignores case here (macOS's and Windows'
+    /// defaults): a name that exists as typed may be spelled otherwise on
+    /// disk, so [`DiskInner::host_path`] lists the folder for it.
+    ignores_case: bool,
 }
 
 /// The console's hard disk over a host folder.
@@ -152,7 +156,9 @@ impl HostDisk {
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root)?;
+        let ignores_case = ignores_case(&root);
         let inner = Arc::new(DiskInner {
+            ignores_case,
             root,
             cache_title: AtomicU32::new(0),
             generation: AtomicU32::new(1),
@@ -454,10 +460,11 @@ impl DiskInner {
     }
 
     /// Host path for a path inside a partition, matching existing names in
-    /// any case, as the console names them ([`name_from_host`]). A name that
-    /// exists as typed is taken without listing its folder; otherwise the
-    /// folder is listed and the first name that matches wins. Missing
-    /// components are spelled as [`name_to_host`] has them.
+    /// any case, as the console names them ([`name_from_host`]), and spelled
+    /// as they are on disk. Where the host's file system tells case apart, a
+    /// name that exists as typed is taken without listing its folder;
+    /// otherwise the folder is listed and the first name that matches wins.
+    /// Missing components are spelled as [`name_to_host`] has them.
     fn host_path(&self, part: u8, rel: &str) -> (PathBuf, Found) {
         let mut out = self.partition_dir(part);
         if !out.is_dir() {
@@ -468,7 +475,7 @@ impl DiskInner {
             let last = parts.peek().is_none();
             let encoded = name_to_host(part);
             let typed = out.join(&encoded);
-            if fs::symlink_metadata(&typed).is_ok() {
+            if !self.ignores_case && fs::symlink_metadata(&typed).is_ok() {
                 out = typed;
                 continue;
             }
@@ -900,6 +907,25 @@ impl Volume for HostVolume {
         let (host, found) = self.disk.host_path(self.part, rel);
         (found == Found::Exists && fs::metadata(&host).is_ok_and(|m| m.is_file())).then_some(host)
     }
+}
+
+/// Whether the file system holding `dir` ignores case: the same folder is
+/// found under its name with the case of every letter swapped. A name with no
+/// letters cannot tell, and counts as telling case apart.
+fn ignores_case(dir: &Path) -> bool {
+    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let swapped: String =
+        name.chars()
+            .map(|c| {
+                if c.is_ascii_lowercase() { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() }
+            })
+            .collect();
+    swapped != name
+        && fs::canonicalize(dir).is_ok_and(|real| {
+            fs::canonicalize(dir.with_file_name(&swapped)).is_ok_and(|other| other == real)
+        })
 }
 
 /// An open file or directory on a hard disk partition.
