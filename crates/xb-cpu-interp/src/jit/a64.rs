@@ -254,6 +254,12 @@ impl Asm {
         self.emit(0xFC60_6800 | m << 16 | n << 5 | t);
     }
 
+    /// `str dT, [xN, #off]`; `off` is a multiple of 8 below 32768.
+    pub(super) fn str_d(&mut self, t: u32, n: u32, off: u32) {
+        debug_assert!(off.is_multiple_of(8) && off < 32768);
+        self.emit(0xFD00_0000 | (off / 8) << 10 | n << 5 | t);
+    }
+
     /// `str xT, [xN, #off]`; `off` is a multiple of 8 below 32768.
     pub(super) fn str_x(&mut self, t: u32, n: u32, off: u32) {
         debug_assert!(off.is_multiple_of(8) && off < 32768);
@@ -479,6 +485,14 @@ mod tests {
         assert_eq!(one(|a| a.str_x(14, 19, 48)), [0xF900_1A6E]); // str x14, [x19, #48]
         assert_eq!(one(|a| a.str_x_idx(2, 23, 12)), [0xF82C_6AE2]); // str x2, [x23, x12]
         assert_eq!(one(|a| a.fmov_x_d(14, 0)), [0x9E66_000E]); // fmov x14, d0
+        assert_eq!(one(|a| a.str_d(0, 10, 64)), [0xFD00_2140]); // str d0, [x10, #64]
+        assert_eq!(one(|a| a.ldr_d(1, 11, 64)), [0xFD40_2161]); // ldr d1, [x11, #64]
+        assert_eq!(one(|a| a.ldr_x(12, 10, 72)), [0xF940_254C]); // ldr x12, [x10, #72]
+        assert_eq!(one(|a| a.str_x(12, 11, 72)), [0xF900_256C]); // str x12, [x11, #72]
+        assert_eq!(one(|a| a.str_x(31, 10, 72)), [0xF900_255F]); // str xzr, [x10, #72]
+        assert_eq!(one(|a| a.str_w(31, 10, 80)), [0xB900_515F]); // str wzr, [x10, #80]
+        assert_eq!(one(|a| a.ldr_w(12, 10, 80)), [0xB940_514C]); // ldr w12, [x10, #80]
+        assert_eq!(one(|a| a.str_w(12, 11, 80)), [0xB900_516C]); // str w12, [x11, #80]
         assert_eq!(one(|a| a.fmov_x_d(14, 1)), [0x9E66_002E]); // fmov x14, d1
         assert_eq!(one(|a| a.str_w(31, 19, 40)), [0xB900_2A7F]); // str wzr, [x19, #40]
         assert_eq!(one(|a| a.strb(31, 19, 41)), [0x3900_A67F]); // strb wzr, [x19, #41]

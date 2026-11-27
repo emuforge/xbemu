@@ -18,7 +18,8 @@ hardware virtualization and makes no assumption about the host's page size.
   (`src/simd.rs`), and the arithmetic flags computed when read
   (`src/flags.rs`).
 - The code generator (`src/jit/`): AArch64 code for blocks that have run a
-  few times, NEON for the MMX forms, and a dispatcher through which one
+  few times, NEON for the MMX forms, double-precision instructions for the
+  common x87 forms, and a dispatcher through which one
   compiled block goes straight on to the next.
 
 ## Invariants
@@ -35,6 +36,9 @@ hardware virtualization and makes no assumption about the host's page size.
   physical pages unwritten.** A guest store to a page holding decoded bytes
   drops that page's blocks before the next block runs; the host's own writes
   to code arrive through `Cpu::invalidate_code`.
+- **A NaN result is picked by the x87's rule** (Intel SDM vol. 1, table
+  4-7), never by the host's operand order, so it is the same whichever path
+  or build computes it.
 - **x87 values are doubles.** Arithmetic is done in `f64`, rounded to single
   when a thread selects single precision; a register keeps its exact 80 bits
   only for values that pass through unchanged (`FLD m80`, `FILD m64`, MMX).

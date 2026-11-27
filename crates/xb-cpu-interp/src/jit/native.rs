@@ -14,7 +14,11 @@
 //!   records them, pushes and pops, and the block's final jump, call,
 //!   return or conditional jump.
 //! * **NEON instructions** for the MMX forms ([`Gen::mmx`]), which keep
-//!   their registers in place in the x87 registers' exact 80-bit fields.
+//!   their registers in place in the x87 registers' exact 80-bit fields,
+//!   and **double-precision instructions** for the common x87 forms
+//!   ([`Gen::x87`]): loads, stores, arithmetic, compares and the stack, on
+//!   the registers' doubles. What is rare (an empty or full register, a
+//!   divisor of zero, a NaN out of numbers) is the interpreter's.
 //! * **A memory access** for those forms' memory operands. The common case
 //!   is made in place with the checks `Mem` makes: the access lies in one
 //!   page, the page-table entry allows it and is not a device's, the
@@ -71,7 +75,7 @@ use std::mem::offset_of;
 use std::ops::ControlFlow;
 use std::ptr::NonNull;
 
-use iced_x86::{Code as C, OpKind, Register};
+use iced_x86::{Code as C, Mnemonic, OpKind, Register};
 use xb_cpu::Bus;
 
 use super::a64::Asm;
@@ -96,6 +100,7 @@ const H_COND: u32 = 3;
 const H_CF: u32 = 4;
 const H_LOAD64: u32 = 5;
 const H_STORE64: u32 = 6;
+const H_FAPPLY: u32 = 7;
 
 /// Instructions of a block before its body: the prologue and the loads of
 /// the tables and the dispatcher's pointers ([`generate`]). The dispatcher
@@ -135,6 +140,9 @@ struct Off {
     valid: u32,
     /// A 64-bit value a helper leaves for the code ([`State::tmp`]).
     tmp: u32,
+    /// The x87 control and status words.
+    fcw: u32,
+    fsw: u32,
     /// [`State::chain`], [`State::trap_lo`], [`State::trap_hi`],
     /// [`State::cur`] and `Mem::seen`.
     chain: u32,
@@ -162,6 +170,8 @@ impl Off {
             st: o(offset_of!(InterpCpu, fpu.st)),
             top: o(offset_of!(InterpCpu, fpu.top)),
             valid: o(offset_of!(InterpCpu, fpu.valid)),
+            fcw: o(offset_of!(InterpCpu, fpu.fcw)),
+            fsw: o(offset_of!(InterpCpu, fpu.fsw)),
             tmp: o(offset_of!(InterpCpu, jit.tmp)),
             chain: o(offset_of!(InterpCpu, jit.chain)),
             trap_lo: o(offset_of!(InterpCpu, jit.trap_lo)),
@@ -186,13 +196,14 @@ impl Off {
             && self.top.is_multiple_of(4)
             && self.top < 16384
             && self.valid < 4096
+            && [self.fcw, self.fsw].into_iter().all(|v| v.is_multiple_of(2) && v < 8192)
             && [self.tmp, self.chain, self.trap_hi, self.seen]
                 .into_iter()
                 .all(|v| v.is_multiple_of(8) && v + 16 < 32768)
             && [self.trap_lo, self.cur].into_iter().all(|v| v.is_multiple_of(4) && v < 16384)
             && [self.helpers, self.tables]
                 .into_iter()
-                .all(|v| v.is_multiple_of(8) && v + 56 < 32768)
+                .all(|v| v.is_multiple_of(8) && v + 64 < 32768)
     }
 }
 
@@ -207,7 +218,7 @@ pub(crate) struct State {
     /// A panic a helper caught, for [`run`] to resume.
     panic: Option<Box<dyn std::any::Any + Send>>,
     /// The helpers' addresses, which generated code loads from here.
-    helpers: [usize; 7],
+    helpers: [usize; 8],
     /// The value [`h_load64`] loaded.
     tmp: u64,
     /// For the dispatcher: the cache's link table, the kick flag and the
@@ -268,6 +279,7 @@ impl State {
                 h_cf as *const () as usize,
                 h_load64 as *const () as usize,
                 h_store64 as *const () as usize,
+                h_fapply as *const () as usize,
             ],
             tmp: 0,
             chain,
@@ -520,6 +532,19 @@ unsafe extern "C" fn h_store64(cpu: *mut InterpCpu, va: u32, v: u64, u: *const U
     unsafe { guarded(cpu, i, body) }
 }
 
+/// `ST(d) = ST(d) op s` as the interpreter does it (`s` as a double's bits),
+/// for the cases generated code leaves to it: a divisor of zero and a NaN
+/// result.
+///
+/// # Safety
+/// As [`h_uop`].
+unsafe extern "C" fn h_fapply(cpu: *mut InterpCpu, op: u32, d: u32, s: u64) -> u64 {
+    // SAFETY: the caller's contract; no bus access.
+    let cpu = unsafe { &mut *cpu };
+    cpu.fapply(op, d, f64::from_bits(s));
+    0
+}
+
 /// Whether condition `cc` holds.
 ///
 /// # Safety
@@ -643,6 +668,30 @@ fn mmx_shift(code: C) -> Option<(u32, u8)> {
         C::Psrad_mm_imm8 => (32, 2),
         _ => return None,
     })
+}
+
+/// Whether `m` is a `SETcc`.
+fn is_setcc(m: Mnemonic) -> bool {
+    use Mnemonic as M;
+    matches!(
+        m,
+        M::Seto
+            | M::Setno
+            | M::Setb
+            | M::Setae
+            | M::Sete
+            | M::Setne
+            | M::Setbe
+            | M::Seta
+            | M::Sets
+            | M::Setns
+            | M::Setp
+            | M::Setnp
+            | M::Setl
+            | M::Setge
+            | M::Setle
+            | M::Setg
+    )
 }
 
 /// A 32-bit general register's number, 0-7.
@@ -1235,7 +1284,7 @@ impl Gen<'_> {
                         }
                     }
                 }
-                C::Movq_mmm64_mm => {
+                C::Movq_mmm64_mm | C::Movntq_m64_mm => {
                     let Some(s) = mm_reg(ins.op_register(1)) else { return false };
                     if mem {
                         Form::MovqOut(s)
@@ -1364,6 +1413,402 @@ impl Gen<'_> {
         true
     }
 
+    /// `wP` = the physical index of ST(i) and `xB` = the CPU's address plus
+    /// 24 times it, so that `[xB, #st + field]` is that register's field.
+    fn fp_phys(&mut self, i: u32, p: u32, base: u32) {
+        self.a.ldr_w(p, 19, self.o.top);
+        if i != 0 {
+            self.a.add_w_imm(p, p, i);
+        }
+        self.a.word(0x1200_0800 | p << 5 | p); // and wP, wP, #7
+        self.a.word(0x8B00_0400 | p << 16 | p << 5 | base); // add xB, xP, xP, lsl #1
+        self.a.word(0x8B00_0C00 | base << 16 | 19 << 5 | base); // add xB, x19, xB, lsl #3
+    }
+
+    /// `w12` bit 0 = whether physical register `wP` is in use.
+    fn fp_bit(&mut self, p: u32) {
+        self.a.ldrb(12, 19, self.o.valid);
+        self.a.word(0x1AC0_2400 | p << 16 | 12 << 5 | 12); // lsr w12, w12, wP
+    }
+
+    /// A branch taken if physical register `wP` is empty.
+    fn fp_empty(&mut self, p: u32) -> usize {
+        self.fp_bit(p);
+        self.a.tbz_w(12, 0)
+    }
+
+    /// A branch taken if physical register `wP` is in use.
+    fn fp_full(&mut self, p: u32) -> usize {
+        self.fp_bit(p);
+        self.a.tbnz_w(12, 0)
+    }
+
+    /// Marks physical register `wP` in use or empty.
+    fn fp_mark(&mut self, p: u32, used: bool) {
+        self.a.ldrb(12, 19, self.o.valid);
+        self.a.mov_w_imm(13, 1);
+        self.a.word(0x1AC0_2000 | p << 16 | 13 << 5 | 13); // lsl w13, w13, wP
+        if used {
+            self.a.orr_w(12, 12, 13);
+        } else {
+            self.a.word(0x0A2D_018C); // bic w12, w12, w13
+        }
+        self.a.strb(12, 19, self.o.valid);
+    }
+
+    /// The register at `xB` = `d0`, a result (no exact bits), as
+    /// `Fpr::from_f64` makes it.
+    fn fp_write(&mut self, base: u32) {
+        self.a.str_d(0, base, self.o.st);
+        self.a.str_x(31, base, self.o.st + 8);
+        self.a.str_w(31, base, self.o.st + 16);
+    }
+
+    /// Copies the register at `xFrom` to `xTo`, exact bits and all.
+    fn fp_copy(&mut self, from: u32, to: u32) {
+        self.a.ldr_x(12, from, self.o.st);
+        self.a.ldr_x(13, from, self.o.st + 8);
+        self.a.ldr_w(15, from, self.o.st + 16);
+        self.a.str_x(12, to, self.o.st);
+        self.a.str_x(13, to, self.o.st + 8);
+        self.a.str_w(15, to, self.o.st + 16);
+    }
+
+    /// Pops the stack: ST0 empty, TOP up by one.
+    fn fp_pop(&mut self) {
+        self.a.ldr_w(9, 19, self.o.top);
+        self.fp_mark(9, false);
+        self.a.add_w_imm(9, 9, 1);
+        self.a.word(0x1200_0929); // and w9, w9, #7
+        self.a.str_w(9, 19, self.o.top);
+    }
+
+    /// `d0` rounded to single when the control word's precision is single
+    /// (`round_pc`).
+    fn fp_round(&mut self) {
+        self.a.ldrh(12, 19, self.o.fcw);
+        self.a.word(0x7218_059F); // tst w12, #0x300
+        let wide = self.a.b_cond(1); // b.ne
+        self.a.word(0x1E62_4000); // fcvt s0, d0
+        self.a.word(0x1E22_C000); // fcvt d0, s0
+        let here = self.a.pos();
+        self.a.patch(wide, here);
+    }
+
+    /// Emits x87 instruction `i`, or one of the forms with no effect, if it
+    /// is a form this covers; false (nothing emitted) if not. Each form
+    /// does what its handler in `x87` does, in the same order.
+    #[expect(clippy::too_many_lines, reason = "one table of forms")]
+    fn x87(&mut self, i: u32, u: &Uop) -> bool {
+        use crate::x87::{FDIV, FDIVR, arith_form, st_index};
+        let ins = &u.ins;
+        let code = ins.code();
+        let mem_ea = || {
+            (ins.op_count() > 0 && ins.op_kind(0) == OpKind::Memory
+                || ins.op_count() > 1 && ins.op_kind(1) == OpKind::Memory)
+                .then(|| ea_of(ins))
+                .flatten()
+        };
+        let has_mem = (0..ins.op_count()).any(|k| ins.op_kind(k) == OpKind::Memory);
+        if has_mem && mem_ea().is_none() {
+            return false;
+        }
+        // Branches to the handler, for what this leaves to the interpreter;
+        // they are taken before anything changes.
+        let mut slow = Vec::new();
+        match code {
+            _ if matches!(
+                ins.mnemonic(),
+                Mnemonic::Nop
+                    | Mnemonic::Pause
+                    | Mnemonic::Prefetchnta
+                    | Mnemonic::Prefetcht0
+                    | Mnemonic::Prefetcht1
+                    | Mnemonic::Prefetcht2
+                    | Mnemonic::Prefetchw
+                    | Mnemonic::Prefetch
+                    | Mnemonic::Sfence
+                    | Mnemonic::Lfence
+                    | Mnemonic::Mfence
+                    | Mnemonic::Wait
+            ) =>
+            {
+                return true;
+            }
+            _ if arith_form(code).is_some() => {
+                let Some((op, form)) = arith_form(code) else { unreachable!() };
+                let (d, src) = match form {
+                    0 | 1 => (0, None),
+                    2 => (0, Some(st_index(ins.op_register(1)))),
+                    _ => (st_index(ins.op_register(0)), Some(0)),
+                };
+                self.fp_phys(d, 9, 10);
+                slow.push(self.fp_empty(9));
+                if let Some(s) = src {
+                    self.fp_phys(s, 14, 11);
+                    slow.push(self.fp_empty(14));
+                }
+                match (form, mem_ea()) {
+                    (0, Some(ea)) => {
+                        self.addr(&ea, 1);
+                        self.load(i, 32);
+                        self.a.word(0x1E27_0000); // fmov s0, w0
+                        self.a.word(0x1E22_C001); // fcvt d1, s0
+                    }
+                    (1, Some(ea)) => {
+                        self.addr(&ea, 1);
+                        self.load64(i);
+                    }
+                    _ => {
+                        let Some(s) = src else { return false };
+                        self.fp_phys(s, 14, 11);
+                        self.a.ldr_d(1, 11, self.o.st);
+                    }
+                }
+                self.fp_phys(d, 9, 10);
+                self.a.ldr_d(0, 10, self.o.st);
+                let mut rare = Vec::new();
+                if op == FDIV {
+                    self.a.word(0x1E60_2028); // fcmp d1, #0.0
+                    rare.push(self.a.b_cond(0));
+                } else if op == FDIVR {
+                    self.a.word(0x1E60_2008); // fcmp d0, #0.0
+                    rare.push(self.a.b_cond(0));
+                }
+                self.a.word(match op {
+                    0 => 0x1E61_2800, // fadd d0, d0, d1
+                    1 => 0x1E61_0800, // fmul d0, d0, d1
+                    2 => 0x1E61_3800, // fsub d0, d0, d1
+                    3 => 0x1E60_3820, // fsub d0, d1, d0
+                    4 => 0x1E61_1800, // fdiv d0, d0, d1
+                    _ => 0x1E60_1820, // fdiv d0, d1, d0
+                });
+                self.a.word(0x1E60_2000); // fcmp d0, d0
+                rare.push(self.a.b_cond(6)); // b.vs: a NaN
+                self.fp_round();
+                self.fp_write(10);
+                let done = self.a.b();
+                let here = self.a.pos();
+                for at in rare {
+                    self.a.patch(at, here);
+                }
+                self.a.mov_x(0, 19);
+                self.a.mov_w_imm(1, op);
+                self.a.mov_w_imm(2, d);
+                self.a.word(0x9E66_0023); // fmov x3, d1
+                self.call(H_FAPPLY);
+                let here = self.a.pos();
+                self.a.patch(done, here);
+                if form == 4 {
+                    self.fp_pop();
+                }
+            }
+            C::Fld_m32fp | C::Fld_m64fp | C::Fild_m32int => {
+                self.fp_phys(7, 9, 10);
+                slow.push(self.fp_full(9));
+                let Some(ea) = mem_ea() else { return false };
+                self.addr(&ea, 1);
+                if code == C::Fld_m64fp {
+                    self.load64(i);
+                    self.a.word(0x1E60_4020); // fmov d0, d1
+                } else {
+                    self.load(i, 32);
+                    if code == C::Fild_m32int {
+                        self.a.word(0x1E62_0000); // scvtf d0, w0
+                    } else {
+                        self.a.word(0x1E27_0000); // fmov s0, w0
+                        self.a.word(0x1E22_C000); // fcvt d0, s0
+                    }
+                }
+                self.fp_phys(7, 9, 10);
+                self.fp_write(10);
+                self.fp_mark(9, true);
+                self.a.str_w(9, 19, self.o.top);
+            }
+            C::Fld_sti => {
+                self.fp_phys(st_index(ins.op_register(0)), 14, 11);
+                slow.push(self.fp_empty(14));
+                self.fp_phys(7, 9, 10);
+                slow.push(self.fp_full(9));
+                self.fp_copy(11, 10);
+                self.fp_mark(9, true);
+                self.a.str_w(9, 19, self.o.top);
+            }
+            C::Fst_m32fp | C::Fstp_m32fp | C::Fst_m64fp | C::Fstp_m64fp => {
+                self.fp_phys(0, 9, 10);
+                slow.push(self.fp_empty(9));
+                self.a.ldr_d(0, 10, self.o.st);
+                let Some(ea) = mem_ea() else { return false };
+                let single = matches!(code, C::Fst_m32fp | C::Fstp_m32fp);
+                if single {
+                    self.a.word(0x1E62_4000); // fcvt s0, d0
+                    self.a.word(0x1E26_0002); // fmov w2, s0
+                } else {
+                    self.a.word(0x9E66_0002); // fmov x2, d0
+                }
+                self.addr(&ea, 1);
+                if single {
+                    self.store(i, 32);
+                } else {
+                    self.store64(i);
+                }
+                self.exit_if_stopped();
+                if matches!(code, C::Fstp_m32fp | C::Fstp_m64fp) {
+                    self.fp_pop();
+                }
+                self.exit_if_status();
+            }
+            C::Fst_sti | C::Fstp_sti => {
+                self.fp_phys(0, 9, 10);
+                slow.push(self.fp_empty(9));
+                self.fp_phys(st_index(ins.op_register(0)), 14, 11);
+                self.fp_copy(10, 11);
+                self.fp_mark(14, true);
+                if code == C::Fstp_sti {
+                    self.fp_pop();
+                }
+            }
+            C::Fcom_m32fp
+            | C::Fcomp_m32fp
+            | C::Fcom_m64fp
+            | C::Fcomp_m64fp
+            | C::Fcom_st0_sti
+            | C::Fcomp_st0_sti
+            | C::Fucom_st0_sti
+            | C::Fucomp_st0_sti => {
+                self.fp_phys(0, 9, 10);
+                slow.push(self.fp_empty(9));
+                let reg = !has_mem;
+                if reg {
+                    self.fp_phys(st_index(ins.op_register(1)), 14, 11);
+                    slow.push(self.fp_empty(14));
+                    self.a.ldr_d(1, 11, self.o.st);
+                } else {
+                    let Some(ea) = mem_ea() else { return false };
+                    self.addr(&ea, 1);
+                    if matches!(code, C::Fcom_m32fp | C::Fcomp_m32fp) {
+                        self.load(i, 32);
+                        self.a.word(0x1E27_0000); // fmov s0, w0
+                        self.a.word(0x1E22_C001); // fcvt d1, s0
+                    } else {
+                        self.load64(i);
+                    }
+                    self.fp_phys(0, 9, 10);
+                }
+                self.a.ldr_d(0, 10, self.o.st);
+                self.a.word(0x1E61_2000); // fcmp d0, d1
+                // C3 C2 C0 as `fcompare` sets them: greater 000, less 001,
+                // equal 100, unordered 111.
+                let mut done = Vec::new();
+                self.a.mov_w_imm(11, 0);
+                done.push(self.a.b_cond(12)); // b.gt
+                self.a.mov_w_imm(11, 0x100);
+                done.push(self.a.b_cond(4)); // b.mi
+                self.a.mov_w_imm(11, 0x4000);
+                done.push(self.a.b_cond(0)); // b.eq
+                self.a.mov_w_imm(11, 0x4500);
+                let here = self.a.pos();
+                for at in done {
+                    self.a.patch(at, here);
+                }
+                self.a.ldrh(12, 19, self.o.fsw);
+                self.a.mov_w_imm(13, 0x4700);
+                self.a.word(0x0A2D_018C); // bic w12, w12, w13
+                self.a.word(0x2A0B_018C); // orr w12, w12, w11
+                self.a.strh(12, 19, self.o.fsw);
+                if matches!(
+                    code,
+                    C::Fcomp_m32fp | C::Fcomp_m64fp | C::Fcomp_st0_sti | C::Fucomp_st0_sti
+                ) {
+                    self.fp_pop();
+                }
+            }
+            C::Fnstsw_AX => {
+                self.a.ldrh(11, 19, self.o.fsw);
+                self.a.mov_w_imm(12, 0x3800);
+                self.a.word(0x0A2C_016B); // bic w11, w11, w12
+                self.a.ldr_w(12, 19, self.o.top);
+                self.a.word(0x2A0C_2D6B); // orr w11, w11, w12, lsl #11
+                self.a.strh(11, 19, self.gpr(0));
+            }
+            C::Fxch_st0_sti => {
+                self.fp_phys(0, 9, 10);
+                slow.push(self.fp_empty(9));
+                self.fp_phys(st_index(ins.op_register(1)), 14, 11);
+                slow.push(self.fp_empty(14));
+                self.a.ldr_x(2, 11, self.o.st);
+                self.a.ldr_x(3, 11, self.o.st + 8);
+                self.a.ldr_w(4, 11, self.o.st + 16);
+                self.fp_copy(10, 11);
+                self.a.str_x(2, 10, self.o.st);
+                self.a.str_x(3, 10, self.o.st + 8);
+                self.a.str_w(4, 10, self.o.st + 16);
+                self.a.ldrh(12, 19, self.o.fsw);
+                self.a.mov_w_imm(13, 0x200);
+                self.a.word(0x0A2D_018C); // bic w12, w12, w13
+                self.a.strh(12, 19, self.o.fsw);
+            }
+            C::Fchs | C::Fabs => {
+                self.fp_phys(0, 9, 10);
+                slow.push(self.fp_empty(9));
+                self.a.ldr_d(0, 10, self.o.st);
+                self.a.word(if code == C::Fchs { 0x1E61_4000 } else { 0x1E60_C000 }); // fneg/fabs d0, d0
+                self.a.str_d(0, 10, self.o.st);
+                // Exact bits keep their significand and change their sign.
+                self.a.ldrb(12, 10, self.o.st + 18);
+                let inexact = self.a.cbz_w(12);
+                self.a.ldrh(12, 10, self.o.st + 16);
+                self.a.word(if code == C::Fchs { 0x5211_018C } else { 0x1200_398C }); // eor #0x8000 / and #0x7fff
+                self.a.strh(12, 10, self.o.st + 16);
+                let here = self.a.pos();
+                self.a.patch(inexact, here);
+            }
+            C::Fldcw_m2byte => {
+                let Some(ea) = mem_ea() else { return false };
+                self.addr(&ea, 1);
+                self.load(i, 16);
+                self.a.strh(0, 19, self.o.fcw);
+            }
+            C::Fnstcw_m2byte => {
+                let Some(ea) = mem_ea() else { return false };
+                self.a.ldrh(2, 19, self.o.fcw);
+                self.addr(&ea, 1);
+                self.store(i, 16);
+                self.exit_if_status();
+            }
+            C::Mov_r8_imm8 => {
+                let n = (ins.op_register(0) as u32).wrapping_sub(Register::AL as u32);
+                if n > 7 {
+                    return false;
+                }
+                self.a.mov_w_imm(9, u32::from(ins.immediate8()));
+                self.a.strb(9, 19, self.gpr8(n as u8));
+            }
+            _ if matches!(ins.mnemonic(), m if is_setcc(m)) && !has_mem => {
+                let n = (ins.op_register(0) as u32).wrapping_sub(Register::AL as u32);
+                if n > 7 {
+                    return false;
+                }
+                self.a.mov_x(0, 19);
+                self.a.mov_w_imm(1, ins.condition_code() as u32 - 1);
+                self.call(H_COND);
+                self.a.strb(0, 19, self.gpr8(n as u8));
+            }
+            _ => return false,
+        }
+        if !slow.is_empty() {
+            let done = self.a.b();
+            let here = self.a.pos();
+            for at in slow {
+                self.a.patch(at, here);
+            }
+            self.handler(i);
+            let here = self.a.pos();
+            self.a.patch(done, here);
+        }
+        true
+    }
+
     /// ESP moves by 4: down (a push) or up.
     fn move_esp(&mut self, down: bool) {
         let esp = self.gpr(ESP);
@@ -1388,6 +1833,9 @@ impl Gen<'_> {
 
     /// Emits instruction `i`; returns whether control goes on to the next.
     fn uop(&mut self, i: u32, u: &Uop) -> bool {
+        if self.x87(i, u) {
+            return true;
+        }
         if !u.fast {
             if !self.mmx(i, u) {
                 self.handler(i);

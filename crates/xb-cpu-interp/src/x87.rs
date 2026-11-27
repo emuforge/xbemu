@@ -683,7 +683,7 @@ impl InterpCpu {
     ) -> Step {
         let (d, _, s) = self.fsrc(ins, bus)?;
         let a = self.stf(d);
-        let r = f(a, s);
+        let r = nan_result(a, s).unwrap_or_else(|| f(a, s));
         if r.is_nan() && !a.is_nan() && !s.is_nan() {
             self.fpu.fsw |= IE;
             self.set_st(d, Fpr::from_f80(F80::INDEFINITE));
@@ -713,8 +713,28 @@ impl InterpCpu {
     }
 }
 
+/// The result of an arithmetic operation with a NaN operand, `None` if
+/// neither is one. The x87 picks it by Intel's rules (SDM vol. 1, table
+/// 4-7), not by the order of the operands: the NaN if only one is, the quiet
+/// one of a signaling and a quiet NaN, else the one with the larger
+/// significand (the destination's on a tie); always made quiet.
+pub(crate) fn nan_result(a: f64, b: f64) -> Option<f64> {
+    const QUIET: u64 = 1 << 51;
+    const FRACTION: u64 = (1 << 52) - 1;
+    let quiet = |v: f64| f64::from_bits(v.to_bits() | QUIET);
+    let signaling = |v: f64| v.to_bits() & QUIET == 0;
+    Some(match (a.is_nan(), b.is_nan()) {
+        (false, false) => return None,
+        (true, false) => quiet(a),
+        (false, true) => quiet(b),
+        _ if signaling(a) != signaling(b) => quiet(if signaling(a) { b } else { a }),
+        _ if b.to_bits() & FRACTION > a.to_bits() & FRACTION => quiet(b),
+        _ => quiet(a),
+    })
+}
+
 /// The index of ST(i) from its register.
-fn st_index(r: Register) -> u32 {
+pub(crate) fn st_index(r: Register) -> u32 {
     (r as u32).wrapping_sub(Register::ST0 as u32) & 7
 }
 
@@ -728,17 +748,17 @@ fn st_index(r: Register) -> u32 {
 // arithmetic form's operation in `imm`.
 
 /// The arithmetic operations, as `Uop::imm` holds them.
-const FADD: u32 = 0;
-const FMUL: u32 = 1;
-const FSUB: u32 = 2;
-const FSUBR: u32 = 3;
-const FDIV: u32 = 4;
-const FDIVR: u32 = 5;
+pub(crate) const FADD: u32 = 0;
+pub(crate) const FMUL: u32 = 1;
+pub(crate) const FSUB: u32 = 2;
+pub(crate) const FSUBR: u32 = 3;
+pub(crate) const FDIV: u32 = 4;
+pub(crate) const FDIVR: u32 = 5;
 
 /// The operation and form of an arithmetic instruction with its own
 /// handler: a single (0) or double (1) in memory, `ST0 op= ST(i)` (2),
 /// `ST(i) op= ST0` (3) or that and a pop (4).
-fn arith_form(code: iced_x86::Code) -> Option<(u32, u8)> {
+pub(crate) fn arith_form(code: iced_x86::Code) -> Option<(u32, u8)> {
     use iced_x86::Code as C;
     Some(match code {
         C::Fadd_m32fp => (FADD, 0),
@@ -864,9 +884,15 @@ impl InterpCpu {
 
     /// `ST(d) = ST(d) op s`, as `farith` and `zero_divide_check` do it.
     #[inline(always)]
-    fn fapply(&mut self, op: u32, d: u32, s: f64) {
+    pub(crate) fn fapply(&mut self, op: u32, d: u32, s: f64) {
         let a = self.stf(d);
         let r = match op {
+            _ if a.is_nan() || s.is_nan() => {
+                if op == FDIV && s == 0.0 || op == FDIVR && a == 0.0 {
+                    self.fpu.fsw |= ZE;
+                }
+                nan_result(a, s).unwrap_or(a)
+            }
             FADD => a + s,
             FMUL => a * s,
             FSUB => a - s,
@@ -990,4 +1016,35 @@ fn fnstsw_ax(c: &mut InterpCpu, _: &Uop, _: &mut dyn Bus) -> Step {
     let v = u32::from(c.fsw());
     c.set_reg(Register::AX, v);
     Ok(Flow::Next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nan_result;
+
+    fn bits(v: Option<f64>) -> Option<u64> {
+        v.map(f64::to_bits)
+    }
+
+    #[test]
+    fn a_nan_result_follows_the_manual_whatever_the_operand_order() {
+        let quiet_small = f64::from_bits(0x7FF8_0000_0000_0001);
+        let quiet_large = f64::from_bits(0xFFF8_0000_0000_0100);
+        let signaling_small = f64::from_bits(0x7FF0_0000_0000_0010);
+        let signaling_large = f64::from_bits(0xFFF0_0000_0001_0000);
+        let all = [quiet_small, quiet_large, signaling_small, signaling_large, 1.5, -0.0];
+        for &x in &all {
+            for &y in &all {
+                assert_eq!(bits(nan_result(x, y)), bits(nan_result(y, x)), "{x:?} {y:?}");
+            }
+        }
+        assert_eq!(nan_result(1.5, -0.0), None);
+        assert_eq!(bits(nan_result(quiet_small, 1.5)), Some(0x7FF8_0000_0000_0001));
+        assert_eq!(bits(nan_result(1.5, signaling_small)), Some(0x7FF8_0000_0000_0010));
+        // A quiet NaN wins over a signaling one, whatever their significands.
+        assert_eq!(bits(nan_result(signaling_large, quiet_small)), Some(0x7FF8_0000_0000_0001));
+        // Of two of a kind, the larger significand.
+        assert_eq!(bits(nan_result(quiet_small, quiet_large)), Some(0xFFF8_0000_0000_0100));
+        assert_eq!(bits(nan_result(signaling_small, signaling_large)), Some(0xFFF8_0000_0001_0000));
+    }
 }

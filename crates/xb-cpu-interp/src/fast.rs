@@ -995,80 +995,93 @@ pub(crate) mod tests {
     const DATA: u32 = 0x0010_0000;
     const STACK: u32 = 0x0020_0000;
 
-    /// Encodings of every form with its own handler (and a few that keep
-    /// the general path, which must then be the general path).
-    /// The MMX forms the code generator compiles. They have no handler of
-    /// their own (the interpreter runs them on its general path), so only
-    /// the comparison of host code with the interpreter takes them; the last
-    /// two read an MMX register holding an x87 value.
-    pub(crate) const MMX_FORMS: &[&[u8]] = &[
-        &[0x0F, 0x6E, 0xC0],             // movd mm0,eax
-        &[0x0F, 0x6E, 0x03],             // movd mm0,[ebx]
-        &[0x0F, 0x7E, 0xC8],             // movd eax,mm1
-        &[0x0F, 0x7E, 0x0B],             // movd [ebx],mm1
-        &[0x0F, 0x6F, 0xC1],             // movq mm0,mm1
-        &[0x0F, 0x6F, 0x03],             // movq mm0,[ebx]
-        &[0x0F, 0x7F, 0x0B],             // movq [ebx],mm1
-        &[0x0F, 0x7F, 0xC8],             // movq mm0,mm1 (7f form)
-        &[0x0F, 0xFD, 0xC1],             // paddw mm0,mm1
-        &[0x0F, 0xFD, 0x03],             // paddw mm0,[ebx]
-        &[0x0F, 0xFC, 0xC1],             // paddb mm0,mm1
-        &[0x0F, 0xFE, 0xC1],             // paddd mm0,mm1
-        &[0x0F, 0xEC, 0xC1],             // paddsb mm0,mm1
-        &[0x0F, 0xED, 0xC1],             // paddsw mm0,mm1
-        &[0x0F, 0xDC, 0xC1],             // paddusb mm0,mm1
-        &[0x0F, 0xDD, 0xC1],             // paddusw mm0,mm1
-        &[0x0F, 0xF8, 0xC1],             // psubb mm0,mm1
-        &[0x0F, 0xF9, 0xC1],             // psubw mm0,mm1
-        &[0x0F, 0xFA, 0xC1],             // psubd mm0,mm1
-        &[0x0F, 0xE8, 0xC1],             // psubsb mm0,mm1
-        &[0x0F, 0xE9, 0xC1],             // psubsw mm0,mm1
-        &[0x0F, 0xD8, 0xC1],             // psubusb mm0,mm1
-        &[0x0F, 0xD9, 0xC1],             // psubusw mm0,mm1
-        &[0x0F, 0xDB, 0x03],             // pand mm0,[ebx]
-        &[0x0F, 0xDF, 0xC1],             // pandn mm0,mm1
-        &[0x0F, 0xEB, 0xC1],             // por mm0,mm1
-        &[0x0F, 0xEF, 0xC0],             // pxor mm0,mm0
-        &[0x0F, 0x74, 0xC1],             // pcmpeqb mm0,mm1
-        &[0x0F, 0x75, 0xC1],             // pcmpeqw mm0,mm1
-        &[0x0F, 0x76, 0xC1],             // pcmpeqd mm0,mm1
-        &[0x0F, 0x64, 0xC1],             // pcmpgtb mm0,mm1
-        &[0x0F, 0x65, 0xC1],             // pcmpgtw mm0,mm1
-        &[0x0F, 0x66, 0xC1],             // pcmpgtd mm0,mm1
-        &[0x0F, 0xD5, 0xC1],             // pmullw mm0,mm1
-        &[0x0F, 0xE5, 0xC1],             // pmulhw mm0,mm1
-        &[0x0F, 0xE4, 0xC1],             // pmulhuw mm0,mm1
-        &[0x0F, 0xF5, 0xC1],             // pmaddwd mm0,mm1
-        &[0x0F, 0xE0, 0xC1],             // pavgb mm0,mm1
-        &[0x0F, 0xE3, 0xC1],             // pavgw mm0,mm1
-        &[0x0F, 0xEE, 0xC1],             // pmaxsw mm0,mm1
-        &[0x0F, 0xEA, 0xC1],             // pminsw mm0,mm1
-        &[0x0F, 0xDE, 0xC1],             // pmaxub mm0,mm1
-        &[0x0F, 0xDA, 0xC1],             // pminub mm0,mm1
-        &[0x0F, 0xF6, 0xC1],             // psadbw mm0,mm1
-        &[0x0F, 0x60, 0xC1],             // punpcklbw mm0,mm1
-        &[0x0F, 0x61, 0xC1],             // punpcklwd mm0,mm1
-        &[0x0F, 0x61, 0x03],             // punpcklwd mm0,[ebx]
-        &[0x0F, 0x62, 0xC1],             // punpckldq mm0,mm1
-        &[0x0F, 0x68, 0xC1],             // punpckhbw mm0,mm1
-        &[0x0F, 0x69, 0xC1],             // punpckhwd mm0,mm1
-        &[0x0F, 0x6A, 0xC1],             // punpckhdq mm0,mm1
-        &[0x0F, 0x63, 0xC1],             // packsswb mm0,mm1
-        &[0x0F, 0x67, 0xC1],             // packuswb mm0,mm1
-        &[0x0F, 0x6B, 0xC1],             // packssdw mm0,mm1
-        &[0x0F, 0x71, 0xF0, 0x05],       // psllw mm0,5
-        &[0x0F, 0x71, 0xF0, 0x10],       // psllw mm0,16
-        &[0x0F, 0x72, 0xF0, 0x07],       // pslld mm0,7
-        &[0x0F, 0x73, 0xF0, 0x09],       // psllq mm0,9
-        &[0x0F, 0x71, 0xD0, 0x03],       // psrlw mm0,3
-        &[0x0F, 0x72, 0xD0, 0x20],       // psrld mm0,32
-        &[0x0F, 0x73, 0xD0, 0x40],       // psrlq mm0,64
-        &[0x0F, 0x71, 0xE0, 0x05],       // psraw mm0,5
-        &[0x0F, 0x72, 0xE0, 0x28],       // psrad mm0,40
-        &[0x0F, 0x71, 0xE0, 0x00],       // psraw mm0,0
-        &[0x0F, 0x77],                   // emms
-        &[0xD9, 0xE8, 0x0F, 0xFD, 0xF9], // fld1; paddw mm7,mm1
-        &[0xD9, 0xE8, 0x0F, 0x7E, 0xF8], // fld1; movd eax,mm7
+    /// Forms the code generator compiles that have no handler of their own
+    /// (the interpreter runs them on its general path), so only the
+    /// comparison of host code with the interpreter takes them: MMX (two of
+    /// them reading an MMX register that holds an x87 value), and the x87,
+    /// `SETcc` and no-effect forms beside.
+    pub(crate) const GENERAL_FORMS: &[&[u8]] = &[
+        &[0x0F, 0x6E, 0xC0],                   // movd mm0,eax
+        &[0x0F, 0x6E, 0x03],                   // movd mm0,[ebx]
+        &[0x0F, 0x7E, 0xC8],                   // movd eax,mm1
+        &[0x0F, 0x7E, 0x0B],                   // movd [ebx],mm1
+        &[0x0F, 0x6F, 0xC1],                   // movq mm0,mm1
+        &[0x0F, 0x6F, 0x03],                   // movq mm0,[ebx]
+        &[0x0F, 0x7F, 0x0B],                   // movq [ebx],mm1
+        &[0x0F, 0x7F, 0xC8],                   // movq mm0,mm1 (7f form)
+        &[0x0F, 0xFD, 0xC1],                   // paddw mm0,mm1
+        &[0x0F, 0xFD, 0x03],                   // paddw mm0,[ebx]
+        &[0x0F, 0xFC, 0xC1],                   // paddb mm0,mm1
+        &[0x0F, 0xFE, 0xC1],                   // paddd mm0,mm1
+        &[0x0F, 0xEC, 0xC1],                   // paddsb mm0,mm1
+        &[0x0F, 0xED, 0xC1],                   // paddsw mm0,mm1
+        &[0x0F, 0xDC, 0xC1],                   // paddusb mm0,mm1
+        &[0x0F, 0xDD, 0xC1],                   // paddusw mm0,mm1
+        &[0x0F, 0xF8, 0xC1],                   // psubb mm0,mm1
+        &[0x0F, 0xF9, 0xC1],                   // psubw mm0,mm1
+        &[0x0F, 0xFA, 0xC1],                   // psubd mm0,mm1
+        &[0x0F, 0xE8, 0xC1],                   // psubsb mm0,mm1
+        &[0x0F, 0xE9, 0xC1],                   // psubsw mm0,mm1
+        &[0x0F, 0xD8, 0xC1],                   // psubusb mm0,mm1
+        &[0x0F, 0xD9, 0xC1],                   // psubusw mm0,mm1
+        &[0x0F, 0xDB, 0x03],                   // pand mm0,[ebx]
+        &[0x0F, 0xDF, 0xC1],                   // pandn mm0,mm1
+        &[0x0F, 0xEB, 0xC1],                   // por mm0,mm1
+        &[0x0F, 0xEF, 0xC0],                   // pxor mm0,mm0
+        &[0x0F, 0x74, 0xC1],                   // pcmpeqb mm0,mm1
+        &[0x0F, 0x75, 0xC1],                   // pcmpeqw mm0,mm1
+        &[0x0F, 0x76, 0xC1],                   // pcmpeqd mm0,mm1
+        &[0x0F, 0x64, 0xC1],                   // pcmpgtb mm0,mm1
+        &[0x0F, 0x65, 0xC1],                   // pcmpgtw mm0,mm1
+        &[0x0F, 0x66, 0xC1],                   // pcmpgtd mm0,mm1
+        &[0x0F, 0xD5, 0xC1],                   // pmullw mm0,mm1
+        &[0x0F, 0xE5, 0xC1],                   // pmulhw mm0,mm1
+        &[0x0F, 0xE4, 0xC1],                   // pmulhuw mm0,mm1
+        &[0x0F, 0xF5, 0xC1],                   // pmaddwd mm0,mm1
+        &[0x0F, 0xE0, 0xC1],                   // pavgb mm0,mm1
+        &[0x0F, 0xE3, 0xC1],                   // pavgw mm0,mm1
+        &[0x0F, 0xEE, 0xC1],                   // pmaxsw mm0,mm1
+        &[0x0F, 0xEA, 0xC1],                   // pminsw mm0,mm1
+        &[0x0F, 0xDE, 0xC1],                   // pmaxub mm0,mm1
+        &[0x0F, 0xDA, 0xC1],                   // pminub mm0,mm1
+        &[0x0F, 0xF6, 0xC1],                   // psadbw mm0,mm1
+        &[0x0F, 0x60, 0xC1],                   // punpcklbw mm0,mm1
+        &[0x0F, 0x61, 0xC1],                   // punpcklwd mm0,mm1
+        &[0x0F, 0x61, 0x03],                   // punpcklwd mm0,[ebx]
+        &[0x0F, 0x62, 0xC1],                   // punpckldq mm0,mm1
+        &[0x0F, 0x68, 0xC1],                   // punpckhbw mm0,mm1
+        &[0x0F, 0x69, 0xC1],                   // punpckhwd mm0,mm1
+        &[0x0F, 0x6A, 0xC1],                   // punpckhdq mm0,mm1
+        &[0x0F, 0x63, 0xC1],                   // packsswb mm0,mm1
+        &[0x0F, 0x67, 0xC1],                   // packuswb mm0,mm1
+        &[0x0F, 0x6B, 0xC1],                   // packssdw mm0,mm1
+        &[0x0F, 0x71, 0xF0, 0x05],             // psllw mm0,5
+        &[0x0F, 0x71, 0xF0, 0x10],             // psllw mm0,16
+        &[0x0F, 0x72, 0xF0, 0x07],             // pslld mm0,7
+        &[0x0F, 0x73, 0xF0, 0x09],             // psllq mm0,9
+        &[0x0F, 0x71, 0xD0, 0x03],             // psrlw mm0,3
+        &[0x0F, 0x72, 0xD0, 0x20],             // psrld mm0,32
+        &[0x0F, 0x73, 0xD0, 0x40],             // psrlq mm0,64
+        &[0x0F, 0x71, 0xE0, 0x05],             // psraw mm0,5
+        &[0x0F, 0x72, 0xE0, 0x28],             // psrad mm0,40
+        &[0x0F, 0x71, 0xE0, 0x00],             // psraw mm0,0
+        &[0x0F, 0x77],                         // emms
+        &[0xD9, 0xE8, 0x0F, 0xFD, 0xF9],       // fld1; paddw mm7,mm1
+        &[0xD9, 0xE8, 0x0F, 0x7E, 0xF8],       // fld1; movd eax,mm7
+        &[0x0F, 0xE7, 0x0B],                   // movntq [ebx],mm1
+        &[0xD9, 0xE0],                         // fchs
+        &[0xD9, 0xE1],                         // fabs
+        &[0xD9, 0x2B],                         // fldcw [ebx]
+        &[0xD9, 0x3B],                         // fnstcw [ebx]
+        &[0x0F, 0x9C, 0xC0],                   // setl al
+        &[0x0F, 0x95, 0xC4],                   // setne ah
+        &[0x0F, 0x97, 0xC1],                   // seta cl
+        &[0xB5, 0x12],                         // mov ch,0x12
+        &[0x0F, 0x1F, 0x00],                   // nop dword [eax]
+        &[0x0F, 0x18, 0x03],                   // prefetchnta [ebx]
+        &[0x9B],                               // fwait
+        &[0x3B, 0xC1, 0x0F, 0x9C, 0xC0],       // cmp eax,ecx; setl al
+        &[0xD9, 0x03, 0xD8, 0x0B, 0xD9, 0x1B], // fld, fmul, fstp dword [ebx]
     ];
 
     pub(crate) const FORMS: &[&[u8]] = &[

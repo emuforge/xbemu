@@ -76,7 +76,7 @@ mod compiled {
     use xb_mem::Ram;
 
     use crate::InterpCpu;
-    use crate::fast::tests::{FORMS, MMX_FORMS, random_fx};
+    use crate::fast::tests::{FORMS, GENERAL_FORMS, random_fx};
 
     const CODE: u32 = 0x0001_0000;
     /// Where the instruction under test sits: near the end of its page, so
@@ -265,7 +265,7 @@ mod compiled {
     fn host_code_leaves_what_the_interpreter_leaves() {
         let mut rng = Rng(0xC0DE);
         let mut native = Some(0);
-        for bytes in FORMS.iter().chain(MMX_FORMS) {
+        for bytes in FORMS.iter().chain(GENERAL_FORMS) {
             for round in 0..120 {
                 let mut gpr: [u32; 8] = std::array::from_fn(|_| rng.next());
                 gpr[1] &= 0xFF;
@@ -293,10 +293,16 @@ mod compiled {
                 };
                 let (want, _) = run(bytes, &st, 0);
                 let (got, runs) = run(bytes, &st, 1);
+                // The bytes of the FXSAVE image that differ, by offset.
+                let fx: Vec<(usize, u8, u8)> = (0..512)
+                    .filter(|&k| want.6[k] != got.6[k])
+                    .map(|k| (k, want.6[k], got.6[k]))
+                    .collect();
                 assert!(
                     want == got,
-                    "{bytes:02x?} from {gpr:08x?} flags {:#x}:\n interpreted {:?} {:08x?} eip {:#x} flags {:#x}\n compiled    {:?} {:08x?} eip {:#x} flags {:#x}",
+                    "{bytes:02x?} from {gpr:08x?} flags {:#x} fx in {:02x?}:\n interpreted {:?} {:08x?} eip {:#x} flags {:#x}\n compiled    {:?} {:08x?} eip {:#x} flags {:#x}\n fx (offset, interpreted, compiled) {fx:02x?}",
                     st.eflags,
+                    &st.fx[..160],
                     want.0,
                     want.1,
                     want.2,
