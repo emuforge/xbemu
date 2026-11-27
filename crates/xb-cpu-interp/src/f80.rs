@@ -24,42 +24,56 @@ const INT_BIT: u64 = 1 << 63;
 /// which arithmetic reads directly, and the exact 80-bit bits when the value
 /// arrived unchanged (`FLD m80`, `FILD m64`, an MMX write), so that storing
 /// it back gives the same bits.
+///
+/// The exact bits are plain fields in a C layout because generated code
+/// reads and writes MMX registers in place (`jit::native`).
 #[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
 pub(crate) struct Fpr {
     pub(crate) f: f64,
-    exact: Option<F80>,
+    /// The exact significand and sign-exponent word, when `has_exact`.
+    pub(crate) mant: u64,
+    pub(crate) se: u16,
+    pub(crate) has_exact: bool,
 }
 
 impl Fpr {
     /// A result: its 80-bit form is the double's.
     #[inline]
     pub(crate) fn from_f64(f: f64) -> Self {
-        Self { f, exact: None }
+        Self { f, mant: 0, se: 0, has_exact: false }
     }
 
     /// A value that arrived as these 80 bits.
     pub(crate) fn from_f80(x: F80) -> Self {
-        Self { f: x.to_f64(), exact: Some(x) }
+        Self { f: x.to_f64(), mant: x.mant, se: x.se, has_exact: true }
+    }
+
+    fn with(f: f64, exact: Option<F80>) -> Self {
+        match exact {
+            Some(x) => Self { f, mant: x.mant, se: x.se, has_exact: true },
+            None => Self::from_f64(f),
+        }
     }
 
     /// The register's 80-bit contents.
     pub(crate) fn f80(self) -> F80 {
-        self.exact.unwrap_or_else(|| F80::from_f64(self.f))
+        self.exact().unwrap_or_else(|| F80::from_f64(self.f))
     }
 
     /// The bits when exact, for conversions that must not lose them.
     pub(crate) fn exact(self) -> Option<F80> {
-        self.exact
+        self.has_exact.then_some(F80 { mant: self.mant, se: self.se })
     }
 
     /// The value with its sign flipped (exact bits kept).
     pub(crate) fn neg(self) -> Self {
-        Self { f: -self.f, exact: self.exact.map(F80::neg) }
+        Self::with(-self.f, self.exact().map(F80::neg))
     }
 
     /// The value with its sign cleared (exact bits kept).
     pub(crate) fn abs(self) -> Self {
-        Self { f: self.f.abs(), exact: self.exact.map(F80::abs) }
+        Self::with(self.f.abs(), self.exact().map(F80::abs))
     }
 }
 

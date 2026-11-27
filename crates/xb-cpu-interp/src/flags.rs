@@ -4,9 +4,11 @@
 //! are never read: the next instruction sets them again. The interpreter
 //! therefore records the last flag-setting operation (kind, size, operands,
 //! result) and computes a flag only when an instruction asks for it.
-//! Instructions whose flags are awkward to derive afterwards (shifts,
-//! rotates, multiplies, BCD adjusts) set them at once with
-//! [`Flags::set_arith`].
+//! The 32-bit shifts by a constant and the two- and three-operand `IMUL`
+//! are recorded the same way, so compiled code records them with a few
+//! stores; instructions whose flags are awkward to derive afterwards
+//! (rotates, shifts by `CL`, the other multiplies, BCD adjusts) set them at
+//! once with [`Flags::set_arith`].
 //!
 //! The values of flags the manuals call undefined follow what a Pentium III
 //! leaves for the cases tests compare (logic operations clear AF); the
@@ -47,6 +49,18 @@ pub(crate) enum Op {
     Inc,
     /// `res = a - 1`, CF kept.
     Dec,
+    /// `res = a << b`, `b` 1 to 31, 32 bits: CF is the last bit shifted
+    /// out, OF is CF xor the result's sign, AF is 0.
+    Shl,
+    /// `res = a >> b` (logical), `b` 1 to 31, 32 bits: CF is the last bit
+    /// shifted out, OF is `a`'s sign, AF is 0.
+    Shr,
+    /// `res = a >> b` (arithmetic), `b` 1 to 31, 32 bits: CF is the last
+    /// bit shifted out, OF and AF are 0.
+    Sar,
+    /// A truncated signed multiply: `res` is the result and `a` is 1 if it
+    /// overflowed (CF = OF = `a`), AF is 0.
+    Mul,
 }
 
 /// EFLAGS of the running context.
@@ -172,6 +186,23 @@ impl Flags {
                     f |= AF;
                 }
             }
+            Op::Shl | Op::Shr | Op::Sar => {
+                let cf = self.cf();
+                f |= cf;
+                let of = match self.op {
+                    Op::Shl => (r >> 31) ^ cf,
+                    Op::Shr => a >> 31,
+                    _ => 0,
+                };
+                if of != 0 {
+                    f |= OF;
+                }
+            }
+            Op::Mul => {
+                if a != 0 {
+                    f |= CF | OF;
+                }
+            }
         }
         f
     }
@@ -190,6 +221,10 @@ impl Flags {
                 let m = mask(self.size);
                 u32::from(self.a & m < self.b & m)
             }
+            Op::Shl => (self.a >> (32 - self.b)) & 1,
+            Op::Shr => (self.a >> (self.b - 1)) & 1,
+            Op::Sar => ((self.a as i32) >> (self.b - 1)) as u32 & 1,
+            Op::Mul => self.a & 1,
         }
     }
 

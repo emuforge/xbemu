@@ -106,9 +106,14 @@ impl InterpCpu {
         let flags = Flags::new(0x2);
         let mem = Mem::new(ram);
         let (tables, pages) = mem.tables();
+        let cache = Cache::new();
+        let kick = Arc::new(AtomicBool::new(false));
+        // What generated code reads to go from block to block.
+        let chain = [cache.links_ptr(), Arc::as_ptr(&kick) as usize, mem.generation_ptr()];
         Self {
+            jit: jit::State::new(tables, pages, chain),
             mem,
-            cache: Cache::new(),
+            cache,
             gpr: [0; 8],
             eip: 0,
             flags,
@@ -120,9 +125,8 @@ impl InterpCpu {
             snap: Snap { gpr: [0; 8], flags },
             exit_if: false,
             trap: (0, 0),
-            kick: Arc::new(AtomicBool::new(false)),
+            kick,
             reported: std::collections::HashSet::new(),
-            jit: jit::State::new(tables, pages),
         }
     }
 
@@ -263,7 +267,10 @@ impl InterpCpu {
                 }
             }
             let leave = match entry {
-                Some(entry) => self.run_native(entry, &ops, bus),
+                Some(entry) => {
+                    self.cache.link(bi, jit::body(entry), ops.as_ptr());
+                    self.run_native(entry, &ops, bi, bus)
+                }
                 None => self.run_ops(&ops, bi, bus),
             };
             self.cache.put_ops(bi, ops);
@@ -300,15 +307,26 @@ impl InterpCpu {
         None
     }
 
-    /// Runs a block's host code: `Some` when `run` must return.
-    fn run_native(&mut self, entry: usize, ops: &[Uop], bus: &mut dyn Bus) -> Option<Exit> {
-        let status = jit::run(entry, self, ops, bus);
+    /// Runs block `bi`'s host code, and the compiled blocks it goes on to:
+    /// `Some` when `run` must return.
+    fn run_native(
+        &mut self,
+        entry: usize,
+        ops: &[Uop],
+        bi: u32,
+        bus: &mut dyn Bus,
+    ) -> Option<Exit> {
+        let status = jit::run(entry, self, ops, bi, bus);
         if status >> 32 != jit::STOPPED {
             return None;
         }
-        let u = ops.get(status as u32 as usize)?;
+        // The block that stopped: this one, or one the code went on to,
+        // whose ops are in the cache.
+        let k = status as u32 as usize;
+        let cur = self.jit.current();
+        let u = if cur == bi { ops.get(k).copied() } else { self.cache.op(cur, k) }?;
         let step = self.jit.take_step()?;
-        self.after(u, step, bus)
+        self.after(&u, step, bus)
     }
 
     /// Acts on the result of instruction `u`, which ends its block: stores
@@ -613,6 +631,7 @@ impl Cpu for InterpCpu {
 
     fn set_trap_range(&mut self, va: u32, len: u32) {
         self.trap = (va, u64::from(va) + u64::from(len));
+        self.jit.set_trap(self.trap);
     }
 
     fn invalidate_code(&mut self, pa: u32, len: u32) {

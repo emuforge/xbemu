@@ -11,6 +11,12 @@
 //! a page holding decoded bytes is seen by [`crate::mem::Mem`]; the run loop
 //! then drops that page's blocks. The host's own writes to code arrive
 //! through `Cpu::invalidate_code`.
+//!
+//! Compiled blocks are also listed in [`Link`]s, a direct-mapped table that
+//! generated code reads to go from one block straight to the next
+//! (`jit::native`'s dispatcher). A block leaves the table whenever it stops
+//! being valid, so a link that is there is a block the run loop would also
+//! run, once the page-table entries it records still hold.
 
 use std::collections::HashMap;
 
@@ -22,8 +28,9 @@ use crate::mem::{Mem, PageFault};
 const MAX_LEN: usize = 64;
 /// Blocks kept before the cache starts again from nothing.
 const MAX_BLOCKS: usize = 1 << 17;
-/// Entries in the direct-mapped lookup in front of the map.
-const FAST: usize = 1 << 14;
+/// Entries in the direct-mapped lookup in front of the map, and in the
+/// table of [`Link`]s; generated code masks addresses with `FAST - 1`.
+pub(crate) const FAST: usize = 1 << 14;
 /// Runs after which a block is worth compiling to host code.
 const HOT_AFTER: u32 = 3;
 /// Times a page's blocks may be dropped before its code is no longer
@@ -61,8 +68,26 @@ pub(crate) enum DecodeError {
 }
 
 /// All blocks, by start address.
+/// A compiled block, for generated code: where it starts, the page-table
+/// entries it was decoded under (`pte1` is 0 unless it ends on the next
+/// page), its index, its host code past the prologue and its ops. `body` is
+/// 0 in an empty slot. The layout is read by generated code.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub(crate) struct Link {
+    pub(crate) eip: u32,
+    pub(crate) pte0: u32,
+    pub(crate) pte1: u32,
+    pub(crate) block: u32,
+    pub(crate) body: usize,
+    pub(crate) ops: usize,
+}
+
 pub(crate) struct Cache {
     blocks: Vec<Block>,
+    /// Compiled blocks by `start & (FAST - 1)`; allocated once, so its
+    /// address can be given to generated code.
+    links: Box<[Link]>,
     by_start: HashMap<u32, u32>,
     /// `(eip, index + 1)`; 0 is an empty slot.
     fast: Box<[(u32, u32)]>,
@@ -80,10 +105,47 @@ impl Cache {
             blocks: Vec::new(),
             by_start: HashMap::new(),
             fast: vec![(0, 0); FAST].into_boxed_slice(),
+            links: vec![Link::default(); FAST].into_boxed_slice(),
             by_page: HashMap::new(),
             churn: HashMap::new(),
             hot_after: HOT_AFTER,
         }
+    }
+
+    /// The address of the [`Link`] table, for generated code.
+    pub(crate) fn links_ptr(&self) -> usize {
+        self.links.as_ptr() as usize
+    }
+
+    /// Lists block `i`, valid and current, as compiled to `body` (its code
+    /// past the prologue) with its ops at `ops`.
+    pub(crate) fn link(&mut self, i: u32, body: usize, ops: *const crate::fast::Uop) {
+        let b = &self.blocks[i as usize];
+        let slot = &mut self.links[(b.start as usize) & (FAST - 1)];
+        if slot.block != i || slot.body != body || slot.eip != b.start {
+            *slot = Link {
+                eip: b.start,
+                pte0: b.pte[0],
+                pte1: b.pte[1],
+                block: i,
+                body,
+                ops: ops as usize,
+            };
+        }
+    }
+
+    /// Takes block `i` out of the [`Link`] table if it is there.
+    fn unlink(&mut self, i: u32) {
+        let start = self.blocks[i as usize].start;
+        let slot = &mut self.links[(start as usize) & (FAST - 1)];
+        if slot.body != 0 && slot.block == i {
+            *slot = Link::default();
+        }
+    }
+
+    /// Instruction `k` of block `i`, whose ops are in the cache.
+    pub(crate) fn op(&self, i: u32, k: usize) -> Option<crate::fast::Uop> {
+        self.blocks.get(i as usize)?.ops.get(k).copied()
     }
 
     /// Block `i`'s host code, if it has been compiled.
@@ -230,6 +292,7 @@ impl Cache {
             }
         }
         if let Some(old) = self.by_start.insert(eip, idx) {
+            self.unlink(old);
             self.blocks[old as usize].valid = false;
         }
         self.fast[(eip as usize) & (FAST - 1)] = (eip, idx + 1);
@@ -237,6 +300,7 @@ impl Cache {
     }
 
     fn drop_block(&mut self, i: u32, _mem: &Mem) {
+        self.unlink(i);
         let b = &mut self.blocks[i as usize];
         b.valid = false;
         b.entry = None;
@@ -270,6 +334,7 @@ impl Cache {
         self.by_start.clear();
         self.by_page.clear();
         self.fast.fill((0, 0));
+        self.links.fill(Link::default());
     }
 }
 

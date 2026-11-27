@@ -76,7 +76,7 @@ mod compiled {
     use xb_mem::Ram;
 
     use crate::InterpCpu;
-    use crate::fast::tests::{FORMS, random_fx};
+    use crate::fast::tests::{FORMS, MMX_FORMS, random_fx};
 
     const CODE: u32 = 0x0001_0000;
     /// Where the instruction under test sits: near the end of its page, so
@@ -228,11 +228,44 @@ mod compiled {
         }
     }
 
+    /// A call whose return address lands on the code of a block that is
+    /// compiled and linked already: that block must run as the bytes now
+    /// are, not as they were (generated code must not go on to it before
+    /// the run loop has dropped it).
+    #[test]
+    fn a_call_that_overwrites_the_next_block_runs_the_new_bytes() {
+        // mov ecx,2; L: call F; F: dec ecx; mov esp,F+4; jnz L
+        let f = AT + 10;
+        let mut bytes =
+            vec![0xB9, 0x02, 0x00, 0x00, 0x00, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x49, 0xBC];
+        bytes.extend_from_slice(&(f + 4).to_le_bytes());
+        bytes.extend_from_slice(&[0x75, 0xF3]);
+        let st = State {
+            gpr: [0, 0, 0, DATA, STACK + 0x1000, 0, 0, 0],
+            eflags: 0x2,
+            data: vec![0; 0x1000],
+            stack: vec![0; 0x2000],
+            fx: xb_cpu::FxState::new().0,
+        };
+        let (want, _) = run(&bytes, &st, 0);
+        let (got, _) = run(&bytes, &st, 1);
+        assert!(
+            want == got,
+            "interpreted {:?} {:08x?} eip {:#x}, compiled {:?} {:08x?} eip {:#x}",
+            want.0,
+            want.1,
+            want.2,
+            got.0,
+            got.1,
+            got.2
+        );
+    }
+
     #[test]
     fn host_code_leaves_what_the_interpreter_leaves() {
         let mut rng = Rng(0xC0DE);
         let mut native = Some(0);
-        for bytes in FORMS {
+        for bytes in FORMS.iter().chain(MMX_FORMS) {
             for round in 0..120 {
                 let mut gpr: [u32; 8] = std::array::from_fn(|_| rng.next());
                 gpr[1] &= 0xFF;

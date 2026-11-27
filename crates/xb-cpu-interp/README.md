@@ -18,7 +18,8 @@ hardware virtualization and makes no assumption about the host's page size.
   (`src/simd.rs`), and the arithmetic flags computed when read
   (`src/flags.rs`).
 - The code generator (`src/jit/`): AArch64 code for blocks that have run a
-  few times.
+  few times, NEON for the MMX forms, and a dispatcher through which one
+  compiled block goes straight on to the next.
 
 ## Invariants
 
@@ -39,6 +40,15 @@ hardware virtualization and makes no assumption about the host's page size.
   only for values that pass through unchanged (`FLD m80`, `FILD m64`, MMX).
 - **Packed integer instructions are MMX**, with or without a `66` prefix, as
   on the console's processor.
+- **A compiled block goes on to another only through the dispatcher**,
+  which returns to the run loop when the CPU is kicked, when `eip` is in
+  the trap range, when write tracking has a restriction the thread has not
+  acknowledged, or when the next block is not compiled or its page-table
+  entries changed. A store that changes code returns to the run loop as
+  well. The cache takes a block out of the dispatcher's table whenever it
+  stops being valid.
+- **An x87 register's exact bits are plain fields** (`f80::Fpr`, C layout):
+  generated code reads and writes MMX registers there in place.
 - **Generated code equals the interpreter.** It implements a subset of
   forms with host instructions and calls the interpreter's own handlers and
   memory access for everything else; a handler and its generated code must

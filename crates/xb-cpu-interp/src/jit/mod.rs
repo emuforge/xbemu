@@ -17,7 +17,7 @@ mod macos;
 mod native;
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-pub(crate) use native::{State, run};
+pub(crate) use native::{State, body, run};
 
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 mod none {
@@ -34,8 +34,15 @@ mod none {
     pub(crate) struct State;
 
     impl State {
-        pub(crate) fn new(_tables: [usize; 4], _pages: u32) -> Self {
+        pub(crate) fn new(_tables: [usize; 4], _pages: u32, _chain: [usize; 3]) -> Self {
             Self
+        }
+
+        pub(crate) fn set_trap(&mut self, _trap: (u32, u64)) {}
+
+        /// Never called: no block runs as host code.
+        pub(crate) fn current(&self) -> u32 {
+            0
         }
 
         /// Never compiles: `Continue(None)`.
@@ -61,14 +68,20 @@ mod none {
         _entry: usize,
         _cpu: &mut InterpCpu,
         _ops: &[Uop],
+        _block: u32,
         _bus: &mut dyn Bus,
     ) -> u64 {
         0
     }
+
+    /// Never called: no block has an entry.
+    pub(crate) fn body(entry: usize) -> usize {
+        entry
+    }
 }
 
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-pub(crate) use none::{State, run};
+pub(crate) use none::{State, body, run};
 
 /// The status generated code returns in its high half when instruction
 /// `status as u32` stopped with a result the run loop must act on

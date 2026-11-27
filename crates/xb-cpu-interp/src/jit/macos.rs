@@ -74,6 +74,11 @@ impl CodeBuf {
         }
     }
 
+    /// The address the next [`CodeBuf::push`] will place its code at.
+    pub(super) fn next(&self) -> usize {
+        self.base as usize + self.used
+    }
+
     /// Forgets all code. Nothing may still hold an address from
     /// [`CodeBuf::push`].
     pub(super) fn reset(&mut self) {

@@ -118,8 +118,9 @@ pub(crate) struct Mem {
     /// One entry per guest virtual page.
     pt: Box<[u32]>,
     shared: Arc<Shared>,
-    /// The generation last acknowledged by this thread.
-    seen: u64,
+    /// The generation last acknowledged by this thread; generated code
+    /// compares it with [`Mem::generation_ptr`]'s.
+    pub(crate) seen: u64,
     /// Per physical RAM page: whether decoded blocks hold its bytes.
     code: Box<[bool]>,
     /// Physical pages with code that guest stores changed since the run
@@ -160,6 +161,12 @@ impl Mem {
             ],
             self.shared.prot.len() as u32,
         )
+    }
+
+    /// The address of the generation counter `protect` advances, which
+    /// lives as long as this `Mem`.
+    pub(crate) fn generation_ptr(&self) -> usize {
+        std::ptr::from_ref(&self.shared.generation) as usize
     }
 
     pub(crate) fn protector(&self) -> Arc<dyn PageProtector> {
