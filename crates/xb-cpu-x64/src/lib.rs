@@ -1,6 +1,6 @@
 //! Guest CPU backend translating x86-32 guest code to x86-64 host code.
 //!
-//! [`X64Cpu`] implements `xb_cpu::Cpu` without help from the host's
+//! `X64Cpu` implements `xb_cpu::Cpu` without help from the host's
 //! virtualization: the title's code is translated block by block into host
 //! code that runs in this process. It is the fallback when `xb-cpu-kvm` is
 //! unavailable and is built on every x86-64 Linux host. On other targets the

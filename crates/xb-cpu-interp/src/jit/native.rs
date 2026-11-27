@@ -10,9 +10,9 @@
 //! * **Host instructions** for the forms title code is made of: 8-, 16-
 //!   and 32-bit moves, `MOVZX`/`MOVSX`, `LEA`, `ADD`/`SUB`/`AND`/`OR`/
 //!   `XOR`/`CMP`/`TEST`, `INC`/`DEC`, shifts by a constant and `IMUL`, with
-//!   the arithmetic flags recorded lazily exactly as [`Flags::lazy`]
-//!   records them, pushes and pops, and the block's final jump, call,
-//!   return or conditional jump.
+//!   the arithmetic flags recorded lazily exactly as
+//!   [`Flags::lazy`](crate::flags::Flags::lazy) records them, pushes and
+//!   pops, and the block's final jump, call, return or conditional jump.
 //! * **NEON instructions** for the MMX forms ([`Gen::mmx`]), which keep
 //!   their registers in place in the x87 registers' exact 80-bit fields,
 //!   and **double-precision instructions** for the common x87 forms

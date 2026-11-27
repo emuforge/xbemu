@@ -12,9 +12,9 @@
 //! to be opened or closed.
 //!
 //! The devices are read by one source a host: Apple's GameController
-//! framework on macOS ([`macos`]), whose drivers are the only way some pads
+//! framework on macOS (`macos`), whose drivers are the only way some pads
 //! are read there (an Xbox pad on USB shows no buttons to anything else),
-//! and `gilrs` elsewhere ([`portable`]). Both answer in `gilrs`'s names for
+//! and `gilrs` elsewhere (`portable`). Both answer in `gilrs`'s names for
 //! buttons and axes, so `input.rs` maps every host's pads the same way.
 
 use xb_core::{PORTS, PadState, Rumble};
