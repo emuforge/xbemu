@@ -1,0 +1,8 @@
+#!/bin/sh
+# Builds (if needed) and runs the standalone front end from a checkout:
+#   ./xbemu path/to/game.cci [options]
+# The working directory is kept, so a relative image path means what it says.
+# The build is `cargo release-build`'s (`.cargo/config.toml`), spelled out
+# because the alias is only found from inside the checkout.
+exec cargo run --release -q --manifest-path "$(dirname "$0")/Cargo.toml" -p xbemu \
+    --config "target.x86_64-unknown-linux-gnu.rustflags=['-Clinker-plugin-lto']" -- "$@"

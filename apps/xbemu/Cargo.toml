@@ -1,0 +1,28 @@
+[package]
+name = "xbemu"
+description = "Standalone xbemu front end: window, gamepads, audio."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+xb-core = { path = "../../crates/xb-core" }
+log = "0.4.29"
+winit = "0.30.13"
+ash = "0.38.0"
+ash-window = "0.13.0"
+gilrs = "0.11.2"
+cpal = "0.18.2"
+
+# PipeWire and PulseAudio desktops are reached through cpal's PulseAudio host
+# (a Rust implementation of the protocol; no system library). Their ALSA
+# "default" device is often the bare hardware, which the sound server holds.
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18.2", features = ["pulseaudio"] }
