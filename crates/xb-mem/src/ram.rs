@@ -350,18 +350,35 @@ mod tests {
     #[test]
     fn a_second_mapping_of_the_memory_object_sees_writes_made_through_the_handle() {
         use std::os::fd::AsRawFd;
-        use std::os::unix::fs::FileExt;
         let ram = Ram::new(4 * PAGE_SIZE).unwrap();
         ram.write(0x2010, b"shared");
-        // Reading the memory object by descriptor stands in for the view a
-        // CPU backend maps from it.
-        let file = std::fs::File::from(ram.fd().try_clone_to_owned().unwrap());
-        assert!(file.as_raw_fd() >= 0);
+        // A second shared mapping of the descriptor is the view a CPU
+        // backend maps from it (macOS shared memory objects cannot be read
+        // with `pread`, so the test maps on every host).
+        let len = ram.size() as usize;
+        // SAFETY: a fresh shared mapping of a valid descriptor of `len`
+        // bytes at an address the kernel picks; unmapped below.
+        let view = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                ram.fd().as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(view, libc::MAP_FAILED);
+        let view = view.cast::<u8>();
         let mut buf = [0u8; 6];
-        file.read_exact_at(&mut buf, 0x2010).unwrap();
+        // SAFETY: both ranges lie inside the `len`-byte mapping and `buf`.
+        unsafe { std::ptr::copy_nonoverlapping(view.add(0x2010), buf.as_mut_ptr(), 6) };
         assert_eq!(&buf, b"shared");
-        file.write_all_at(b"back", 0x3000).unwrap();
+        // SAFETY: as above.
+        unsafe { std::ptr::copy_nonoverlapping(b"back".as_ptr(), view.add(0x3000), 4) };
         assert_eq!(ram.read_vec(0x3000, 4).unwrap(), b"back");
+        // SAFETY: exactly the mapping made above; no pointer into it remains.
+        unsafe { libc::munmap(view.cast(), len) };
     }
 
     #[test]

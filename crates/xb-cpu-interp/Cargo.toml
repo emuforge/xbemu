@@ -1,0 +1,33 @@
+[package]
+name = "xb-cpu-interp"
+description = "Guest CPU backend interpreting x86-32 guest code, for hosts of any architecture."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+xb-cpu = { path = "../xb-cpu" }
+xb-mem = { path = "../xb-mem" }
+xb-types = { path = "../xb-types" }
+log = "0.4.29"
+# MIT. x86 decoder, instruction facts (condition codes) and the formatter
+# (the log line naming an instruction the interpreter does not implement).
+iced-x86 = { version = "1.22.0", default-features = false, features = ["std", "decoder", "instr_info", "intel"] }
+
+# MIT OR Apache-2.0. The code generator's executable memory (mmap with
+# MAP_JIT, the per-thread write protection).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.190"
+
+[dev-dependencies]
+# The backend-neutral conformance cases: the contract (`xb_cpu_kvm::testing`)
+# and the instruction snippets (`xb_cpu_x64::testing`).
+xb-cpu-kvm = { path = "../xb-cpu-kvm", features = ["testing"] }
+xb-cpu-x64 = { path = "../xb-cpu-x64", features = ["testing"] }

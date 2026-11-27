@@ -6,7 +6,7 @@ Layer L1. Depends on `xb-types`, `log` and (on Unix hosts) `libc`.
 
 | Type | What | Threads |
 |---|---|---|
-| `Ram` | Guest physical RAM: one shared memory object (`memfd_create` on Linux) mapped once read-write in the host. A cheap `Clone` handle implementing `xb_types::mem::PhysMem`; exposes the descriptor for CPU backends and a raw pointer for the vendored C. | any |
+| `Ram` | Guest physical RAM: one shared memory object (`memfd_create` on Linux, an unlinked `shm_open` object on macOS) mapped once read-write in the host. A cheap `Clone` handle implementing `xb_types::mem::PhysMem`; exposes the descriptor for CPU backends and a raw pointer for the vendored C. | any |
 | `AddressSpace` | The guest's page table (one `u32` entry per 4 KiB page of the 4 GiB space), the reverse map from physical page to virtual address, host access by guest virtual address, and the allocators that relocate pages. | guest CPU |
 | `PhysAllocator` | Which RAM pages are in use and which are pinned. | guest CPU |
 | `WriteTracker` | Per-physical-page write tracking with the reference's semantics, over an `Arc<dyn PageProtector>`. | any |
@@ -70,9 +70,11 @@ for a consistent snapshot.
 Allowed, and confined to two places; the crate root has
 `#![deny(unsafe_code)]` and these two modules opt in:
 
-- `src/host/linux.rs`: `memfd_create`, `mmap`, `munmap`, `Send`/`Sync` for
-  the mapping.
-- `src/ram.rs`: the raw copies into and out of the mapping.
+- `src/host/linux.rs`, `src/host/macos.rs`: creating the memory object
+  (`memfd_create`, `shm_open`), `mmap`, `munmap`, `Send`/`Sync` for the
+  mapping.
+- `src/ram.rs`: the raw copies into and out of the mapping, and a test
+  that maps a second view of the descriptor.
 
 Another host adds a module under `src/host/` exporting the same `SharedMem`
 (Windows: `CreateFileMappingW` / `MapViewOfFile`) and the matching accessor

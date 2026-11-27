@@ -67,6 +67,8 @@ use xb_types::settings::{Aspect, Settings};
 pub use host::{
     CpuRegs, DiscStats, GpuHost, StaleNeighbour, SurfaceProvider, VkInstance, VkSurfaceKHR,
 };
+#[cfg(target_os = "macos")]
+pub use os::vulkan_libraries;
 pub use present::{FrameStats, OverlayImage};
 
 use ffi::{CDecoder, HostClock, Shared};
@@ -336,7 +338,10 @@ impl Gpu {
         let spawn = |name: &str, body: fn(&'static Shared)| {
             std::thread::Builder::new()
                 .name(name.into())
-                .spawn(move || body(shared))
+                .spawn(move || {
+                    xb_types::thread::pacing();
+                    body(shared);
+                })
                 .expect("spawning a GPU timer thread")
         };
         let threads = vec![

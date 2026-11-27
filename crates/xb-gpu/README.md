@@ -54,7 +54,9 @@ block has a `// SAFETY:` comment.
 - Third-party sources in `third_party/` (run `tools/fetch-deps.sh`, which
   needs `git` and network access) or in `XBEMU_DEPS_DIR`: Vulkan-Headers,
   volk, glslang, SPIRV-Reflect, xxHash, nv2a_vsh_cpu, at the reference's pins.
-- At run time: a Vulkan loader (`libvulkan.so.1`) and a Vulkan 1.1+ driver.
+- At run time: a Vulkan loader (`libvulkan.so.1`; on macOS
+  `libvulkan.1.dylib`, looked for also in `/opt/homebrew/lib` and
+  `/usr/local/lib`) and a Vulkan 1.1+ driver (on macOS, MoltenVK).
   No Vulkan development package is needed to build (headers are fetched,
   the loader is opened at run time by volk).
 

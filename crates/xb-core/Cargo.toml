@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 xb-types = { path = "../xb-types" }
 xb-cpu = { path = "../xb-cpu" }
+xb-cpu-interp = { path = "../xb-cpu-interp" }
 xb-mem = { path = "../xb-mem" }
 xb-formats = { path = "../xb-formats" }
 xb-fs = { path = "../xb-fs" }

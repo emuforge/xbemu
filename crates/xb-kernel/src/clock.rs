@@ -418,7 +418,10 @@ impl Ticker {
         let s = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("xb-clock".to_owned())
-            .spawn(move || tick_thread(&s, &clock, &wake))
+            .spawn(move || {
+                xb_types::thread::pacing();
+                tick_thread(&s, &clock, &wake);
+            })
             .ok();
         if thread.is_none() {
             log::error!(target: "kernel", "the clock thread could not be started: timers fire only at kernel entries");

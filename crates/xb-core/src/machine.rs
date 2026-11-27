@@ -26,40 +26,105 @@ thread_local! {
     static GUEST_THREAD: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The guest-CPU thread's CPU-time clock, for the statistics line; 0 before
-/// the thread has started.
-static GUEST_CPU_CLOCK: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-
 /// Marks the calling thread as the guest-CPU thread.
 pub(crate) fn mark_guest_thread() {
     GUEST_THREAD.with(|g| g.set(true));
-    let mut clock: libc::clockid_t = 0;
-    // SAFETY: `pthread_self` is the calling thread's handle and `clock` a
-    // valid place for the result.
-    if unsafe { libc::pthread_getcpuclockid(libc::pthread_self(), &raw mut clock) } == 0 {
-        GUEST_CPU_CLOCK.store(clock, Ordering::Relaxed);
-    }
+    cpu_time::remember_this_thread();
 }
 
 /// The host CPU time the guest-CPU thread has used, in nanoseconds (0 if it
 /// is not known or the thread has ended).
 pub(crate) fn guest_thread_cpu_ns() -> u64 {
-    let clock = GUEST_CPU_CLOCK.load(Ordering::Relaxed);
-    if clock == 0 {
-        return 0;
-    }
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: `ts` is a valid, writable timespec. A clock id of a thread
-    // that has ended makes the call fail, which is checked.
-    if unsafe { libc::clock_gettime(clock, &raw mut ts) } != 0 {
-        return 0;
-    }
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    cpu_time::guest_ns()
 }
 
 /// Forgets the guest-CPU thread's clock; call as the thread ends.
 pub(crate) fn unmark_guest_thread() {
-    GUEST_CPU_CLOCK.store(0, Ordering::Relaxed);
+    cpu_time::forget();
+}
+
+/// The guest-CPU thread's CPU time, for the statistics line, read from
+/// another thread: on Linux through the thread's CPU-time clock, on macOS
+/// through its Mach port (`thread_info`). Elsewhere it is unknown (0).
+mod cpu_time {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// The guest-CPU thread's handle (a clock id or a Mach port); 0 before
+    /// the thread has started and after it ends.
+    static HANDLE: AtomicU32 = AtomicU32::new(0);
+
+    pub(super) fn forget() {
+        HANDLE.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(super) fn remember_this_thread() {
+        let mut clock: libc::clockid_t = 0;
+        // SAFETY: `pthread_self` is the calling thread's handle and `clock` a
+        // valid place for the result.
+        if unsafe { libc::pthread_getcpuclockid(libc::pthread_self(), &raw mut clock) } == 0 {
+            HANDLE.store(clock as u32, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(super) fn guest_ns() -> u64 {
+        let clock = HANDLE.load(Ordering::Relaxed);
+        if clock == 0 {
+            return 0;
+        }
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: `ts` is a valid, writable timespec. A clock id of a thread
+        // that has ended makes the call fail, which is checked.
+        if unsafe { libc::clock_gettime(clock as libc::clockid_t, &raw mut ts) } != 0 {
+            return 0;
+        }
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn remember_this_thread() {
+        // SAFETY: `pthread_self` is the calling thread's handle; the port
+        // stays valid while the thread lives (`forget` runs as it ends).
+        let port = unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) };
+        HANDLE.store(port, Ordering::Relaxed);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn guest_ns() -> u64 {
+        let port = HANDLE.load(Ordering::Relaxed);
+        if port == 0 {
+            return 0;
+        }
+        let mut info = std::mem::MaybeUninit::<libc::thread_basic_info>::zeroed();
+        let mut count = libc::THREAD_BASIC_INFO_COUNT;
+        // SAFETY: `info` has room for THREAD_BASIC_INFO_COUNT words, which
+        // `count` says; a port of an ended thread makes the call fail.
+        let r = unsafe {
+            libc::thread_info(
+                port,
+                libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
+                info.as_mut_ptr().cast(),
+                &raw mut count,
+            )
+        };
+        if r != libc::KERN_SUCCESS {
+            return 0;
+        }
+        // SAFETY: the call succeeded and filled the structure.
+        let info = unsafe { info.assume_init() };
+        let us = |t: libc::time_value_t| t.seconds as u64 * 1_000_000 + t.microseconds as u64;
+        (us(info.user_time) + us(info.system_time)) * 1000
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    pub(super) fn remember_this_thread() {}
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    pub(super) fn guest_ns() -> u64 {
+        let _ = HANDLE.load(Ordering::Relaxed);
+        0
+    }
 }
 
 fn on_guest_thread() -> bool {

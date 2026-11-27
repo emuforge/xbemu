@@ -71,7 +71,7 @@ A crate MUST NOT depend on a crate in a higher layer.
 |---|---|
 | L0 | `xb-types`, `xb-formats`, `xb-testkit` (tests only) |
 | L1 | `xb-cpu` (interface), `xb-mem`, `xb-fs`, `xb-menu` |
-| L2 | `xb-cpu-kvm`, `xb-cpu-x64`, `xb-kernel`, `xb-devices`, `xb-gpu`, `xb-apu` |
+| L2 | `xb-cpu-kvm`, `xb-cpu-x64`, `xb-cpu-interp`, `xb-kernel`, `xb-devices`, `xb-gpu`, `xb-apu` |
 | L3 | `xb-core` |
 | apps | `apps/xbemu` |
 
@@ -82,9 +82,9 @@ implements the trait.
 ## Code
 
 - **`unsafe`** is allowed only in `xb-mem`, `xb-cpu-kvm`, `xb-cpu-x64`,
-  `xb-gpu`, `xb-apu`, `xb-core` and the app's `surface.rs` (creating the
-  Vulkan surface). Every other crate has
-  `#![forbid(unsafe_code)]`. Every `unsafe` block MUST have a `// SAFETY:`
+  `xb-cpu-interp` (its code generator, `src/jit`, alone), `xb-gpu`,
+  `xb-apu`, `xb-core` and the app's `surface.rs` (creating the Vulkan
+  surface). Every other crate has `#![forbid(unsafe_code)]`. Every `unsafe` block MUST have a `// SAFETY:`
   comment and every `unsafe fn` a `# Safety` section.
 - **C code** exists only as vendored libraries under `vendor/` (the GPU
   renderer and the APU), each behind one crate. New C glue MUST NOT be added

@@ -45,6 +45,7 @@ mod audio;
 mod input;
 mod logger;
 mod pads;
+mod picker;
 mod platform;
 mod selftest;
 mod session;
@@ -212,7 +213,17 @@ fn run(options: Options) -> u8 {
 }
 
 fn main() -> ExitCode {
-    let options = match args::parse(std::env::args_os().skip(1)) {
+    let mut command_line: Vec<_> = std::env::args_os().skip(1).collect();
+    // Started with nothing (from the Finder or the Dock): ask for a disc
+    // where the host has a picker.
+    if command_line.is_empty() {
+        match picker::choose_disc() {
+            picker::Choice::Disc(path) => command_line.push(path.into_os_string()),
+            picker::Choice::Cancelled => return ExitCode::SUCCESS,
+            picker::Choice::Unavailable => {}
+        }
+    }
+    let options = match args::parse(command_line) {
         Ok(Command::Run(options)) => options,
         Ok(Command::Help) => {
             print!("{}", args::USAGE);

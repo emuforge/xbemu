@@ -37,6 +37,11 @@ uint32_t hle_draw_prim_topology(uint32_t pt);
 uint32_t hle_draw_prim_count(uint32_t pt, uint32_t n);
 void hle_draw_prim_indices(uint32_t pt, const uint16_t *in, uint32_t n, uint32_t base,
                            uint16_t *out);
+#if defined(XBEMU_HOST)
+/* xbemu: whether a primitive is drawn from converted indices (quads, line
+ * loops, outlines; on Apple hosts also fans and polygons) */
+bool hle_draw_prim_converted(uint32_t pt);
+#endif
 
 /* Texels the CPU wrote at pa (linear rows of pitch bytes) into object id's
  * image: rects of source pixels, each to its pts[i] (HLE_OP_UPLOAD). */

@@ -196,6 +196,9 @@ void hle_pipe_lower_priority(void)
     setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);
 #elif defined(_WIN32)
     nc_win_thread_priority(-1);
+#elif defined(XBEMU_HOST) && defined(__APPLE__)
+    /* xbemu: macOS lowers a thread by its class of service */
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 #endif
 }
 

@@ -1,8 +1,8 @@
 # Changes to the vendored files
 
-`crates/xb-gpu/build.rs` defines `XBEMU_HOST=1`. Changes 1 to 13 are each
-inside `#if defined(XBEMU_HOST)` (or widen an existing `#if` with it);
-without the define those compile as xbased's do. Changes 14 to 16 are not
+`crates/xb-gpu/build.rs` defines `XBEMU_HOST=1`. Changes 1 to 13 and 17
+to 20 are each inside `#if defined(XBEMU_HOST)` (or widen an existing `#if`
+with it); without the define those compile as xbased's do. Changes 14 to 16 are not
 yet held to that: not all of their lines are inside the `#if`. Two C files
 were added, both xbemu's own, under `shim/` (change 7).
 
@@ -305,12 +305,96 @@ end's waits on the render thread not wake it.
   sleeps and kicks, the render thread's short waits, sleeps, timeouts and
   wakes).
 
+## 17. macOS
+
+Each inside `#if defined(XBEMU_HOST) && defined(__APPLE__)`:
+
+- `hw/xbox/hle/util/thread.c`, `thread.h`:
+  - no `pthread_condattr_setclock` (macOS has none); the file's
+    `pthread_cond_timedwait` calls, each with a deadline on
+    `CLOCK_MONOTONIC`, go through `abs_wait`, which waits the time left to
+    the deadline with `pthread_cond_timedwait_relative_np`;
+  - `HleSem` is a dispatch semaphore: macOS's `sem_init` fails (no unnamed
+    POSIX semaphores) and it has no `sem_timedwait`. It is made at 0 and
+    posted up to its initial count, as libdispatch faults when one is freed
+    below the count it was made with;
+  - a thread names itself (`named_start`, and the timer thread):
+    macOS's `pthread_setname_np` names only the calling thread.
+- `hw/xbox/hle/hitch.c`: no per-thread CPU clock (`pthread_getcpuclockid`
+  does not exist): the hitch reports leave the threads' CPU time out.
+- `hw/xbox/hle/mem/barrier.c`: `CTR_EL0` is not read (macOS traps the read
+  from user space); the cache-line step stays at its 64-byte default, no
+  wider than Apple's cores' lines (`hw.cachelinesize` 128), so every line
+  of a range is reached.
+- `hw/xbox/hle/vk/pipeasync.c`: `hle_pipe_lower_priority` gives the
+  pipeline workers the utility class of service, macOS's way of lowering a
+  thread, where Linux raises its nice value.
+
+Why: these are what the renderer needs of the host that macOS does not
+have, or has under another name. The arm64 paths themselves (the counter
+registers, the cache-line cleaning, the NEON swizzle) are hakuX's, kept as
+they are; hakuX reads `CTR_EL0` on Android, where the kernel allows it.
+
+## 18. Portability drivers
+
+- `hw/xbox/hle/vk/vkdev.c`, inside `#if defined(XBEMU_HOST)`: the instance
+  enables `VK_KHR_portability_enumeration` and sets
+  `VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR` where the loader has
+  it. Inside `#if defined(XBEMU_HOST) && defined(VK_KHR_portability_subset)`:
+  a device that offers `VK_KHR_portability_subset` gets it enabled, with
+  the subset's features as the device reports them, and the features are
+  logged.
+
+Why: the Vulkan loader lists a portability driver (MoltenVK on macOS) only
+to an instance that asks for one, and the specification requires the
+subset extension to be enabled on a device that offers it.
+`VK_KHR_portability_subset` is a beta extension of the headers:
+`crates/xb-gpu/build.rs` defines `VK_ENABLE_BETA_EXTENSIONS` on Apple
+targets, for volk and the renderer alike (it changes the layout of volk's
+function tables).
+
+## 19. Triangle fans as triangle lists on Apple hosts
+
+- `hw/xbox/hle/pb/pbres.c`: under `XBEMU_HOST` and `__APPLE__`
+  (`FANS_AS_LISTS`), `hle_draw_prim_topology` gives triangle fans and
+  polygons a triangle list, `hle_draw_prim_count` counts `(n - 2) * 3`
+  indices for them and `hle_draw_prim_indices` writes each fan triangle
+  `0, i, i + 1`. A new `hle_draw_prim_converted` (declared in `pbres.h`,
+  inside the define) names the primitives drawn from converted indices.
+- `hw/xbox/hle/pb/pbdraw.c`: the array draw's two tests of which primitives
+  are converted call `hle_draw_prim_converted` instead of listing them.
+
+Why: Metal has no triangle fans, and MoltenVK's emulation of them draws
+only a fan's first triangle. Halo's intro movie, drawn as one full-screen
+fan, showed half a picture cut along the diagonal; as a triangle list it is
+whole. Other hosts keep the fan topology.
+
+## 20. MoltenVK as the reference's macOS build runs it
+
+- `hw/xbox/hle/vk/vkdev.c`, inside `XBEMU_HOST`: bindless is off when the
+  driver is MoltenVK (`VK_DRIVER_ID_MOLTENVK`), as in the reference's macOS
+  port. Inside `XBEMU_HOST` and `__APPLE__`: the instance enables
+  `VK_EXT_layer_settings` and passes MoltenVK
+  `MVK_CONFIG_FAST_MATH_ENABLED = 0`, unless that variable is set in the
+  environment (a layer setting would override it).
+
+Why: the reference's macOS port turns both off. Fast math lets Metal's
+compiler reorder and approximate float operations, which changes what a
+title's shaders compute. The setting goes through the instance rather than
+the environment because the renderer starts after other threads are
+running.
+
 ## Not patches, but worth knowing
+
+- On macOS `hle_host_vk_loader` (`crates/xb-gpu/src/ffi.rs`, `src/os.rs`)
+  opens the Vulkan loader itself, also from Homebrew's `/opt/homebrew/lib`
+  and `/usr/local/lib`, where volk's search by name does not look.
 
 - `__system_property_get` (declared by the vendored
   `native/compat/linux/include/sys/system_properties.h`, implemented by
   xbased's `native/compat/linux/linux.c`) is implemented in
-  `crates/xb-gpu/src/ffi.rs`: a property is the environment variable of the
+  `crates/xb-gpu/src/ffi.rs`, and the header is on the include path of every
+  host but Android, whose own it is: a property is the environment variable of the
   same name in capitals with `_` for `.`. xbased's `props.ini` file and
   run-time property setting are not implemented.
 - `g_hle.posture` is set to `HLE_POSTURE_REPLACE` from Rust after `hle_init`

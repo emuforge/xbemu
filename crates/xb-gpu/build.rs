@@ -126,7 +126,7 @@ fn main() {
 
     // The renderer.
     let mut hle = c_build(&target_os, &target_arch);
-    if target_os == "linux" {
+    if target_os != "android" {
         // Android's <sys/system_properties.h>, which the renderer's debug
         // switches read; `src/ffi.rs` implements it.
         hle.include(vendor.join("native/compat/linux/include"));
@@ -230,6 +230,12 @@ fn c_build(target_os: &str, target_arch: &str) -> cc::Build {
     }
     if target_arch == "x86_64" {
         b.flag_if_supported("-msse4.1").flag_if_supported("-mpopcnt");
+    }
+    if target_os == "macos" || target_os == "ios" {
+        // The portability subset (MoltenVK's) is a beta extension of the
+        // headers. Every file that includes volk.h must agree on this: it
+        // changes the layout of volk's function tables.
+        b.define("VK_ENABLE_BETA_EXTENSIONS", None);
     }
     b
 }

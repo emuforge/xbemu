@@ -29,8 +29,8 @@ pub fn default_data_dir() -> Option<PathBuf> {
 /// The XDG base directory rule: `$XDG_DATA_HOME/xbemu` if that is set to an
 /// absolute path, else `$HOME/.local/share/xbemu`.
 #[cfg_attr(
-    any(target_os = "windows", target_os = "macos"),
-    expect(dead_code, reason = "XDG hosts")
+    all(not(test), any(target_os = "windows", target_os = "macos")),
+    expect(dead_code, reason = "XDG hosts; the tests call it everywhere")
 )]
 fn xdg_data_dir(xdg_data_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
     let absolute = |v: OsString| Some(PathBuf::from(v)).filter(|p| p.is_absolute());

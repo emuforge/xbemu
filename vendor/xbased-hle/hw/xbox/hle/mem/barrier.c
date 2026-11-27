@@ -141,7 +141,9 @@ void hle_barrier_init(uint64_t ram_size)
     }
     g_nbr_n = g_new0(uint16_t, ram_size >> 12);
     g_nbr_t = g_new0(uint32_t, ram_size >> 12);
-#if defined(__aarch64__)
+/* xbemu: macOS traps a read of CTR_EL0; the 64-byte default steps no wider
+ * than its cores' lines (hw.cachelinesize: 128), so it reaches every line */
+#if defined(__aarch64__) && !(defined(XBEMU_HOST) && defined(__APPLE__))
     {
         uint64_t ctr;
         __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));

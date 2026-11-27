@@ -678,11 +678,12 @@ pub extern "C" fn hle_host_anisotropy() -> c_int {
     shared().map_or(0, |s| s.anisotropy.load(Ordering::Relaxed))
 }
 
-/// `hle_host_vk_loader`: NULL, so volk loads the system's Vulkan loader
-/// (`libvulkan.so.1`). A custom driver (Android's Turnip) would go here.
+/// `hle_host_vk_loader`: the Vulkan loader where volk would not find it
+/// (`os::vk_loader`), else NULL, and volk loads the system's. A custom
+/// driver (Android's Turnip) would go here.
 #[unsafe(no_mangle)]
 pub extern "C" fn hle_host_vk_loader() -> *mut c_void {
-    std::ptr::null_mut()
+    os::vk_loader()
 }
 
 /// `hle_host_disc_stats`.

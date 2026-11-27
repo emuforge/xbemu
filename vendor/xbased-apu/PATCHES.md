@@ -3,7 +3,7 @@
 ## Files from xbased (`native/`)
 
 Three files under `native/dev/apu` differ from xbased 1.2.5: `apu.c`,
-`dsp/dsp_rec.cpp` and `dsp/gp_ep.c`, by the numbered change below and the
+`dsp/dsp_rec.cpp` and `dsp/gp_ep.c`, by the numbered changes below and the
 changes under "Changes for speed". The changes are marked `xbemu:` in the
 source. Every other file there, and `native/cpu/x64asm.h`, is identical.
 
@@ -20,6 +20,20 @@ source. Every other file there, and `native/cpu/x64asm.h`, is identical.
    that way. The instructions run are the same, to the count
    (`XBASED_APU_STATS=1`).
 
+2. **`apu.c`, `dsp/gp_ep.c`: macOS.** Inside `#if defined(XBEMU_HOST) &&
+   defined(__APPLE__)`:
+   - `apu_cond_init` does not call `pthread_condattr_setclock`, which macOS
+     lacks, and `apu_cond_timedwait_us` waits with
+     `pthread_cond_timedwait_relative_np`: the same wait, relative to now
+     on a clock wall-clock changes do not move.
+   - `apu_thread_start` starts the thread through `apu_named_start`, which
+     names it and calls the thread's function: macOS's
+     `pthread_setname_np` names only the calling thread.
+   - `gp_ep.c`: the `XBASED_APU_STATS` block around the GP's `dsp_run`
+     counts TSC ticks, so it is compiled on x86-64 only
+     (`defined(__x86_64__)` added to its two `#if`s), as the transfer
+     counters it reads already were.
+
 Everything else xbemu needs differently is done outside those files:
 
 | Need | How, without touching the source |
@@ -30,7 +44,7 @@ Everything else xbemu needs differently is done outside those files:
 | `state.c` (savestates) includes xbased's `native/state` headers | `shim/include/native/state/{state.h,def.h,sections.h}` declare the byte buffer and the one record it uses; `shim/apu_shim.c` implements them and hands the state to Rust as bytes (`xb_apu_shim_state_save`, `_load`, `_free`). `state.c` itself is compiled as it is. Its buffer and record functions and its two entry points are renamed at compile time (`build.rs` `RENAMES`), as the renderer has the reference's own under the same names. |
 | The frame thread must not run before `Apu::start`, and must stop for a pause | It already parks in `nc_pause_wait` while `nc_paused()`; Rust implements both. |
 | `gp_ep.c` remembers the last output preference in a function static, so a second device in one process could skip applying it | `ffi.rs` applies the opposite preference and then the wanted one after init. |
-| The recompiler does not exist off x86-64 (xbased 1.2.5 itself builds for x86-64 only) | `dsp_rec.cpp` is left out there and `ffi.rs` defines `dsp_rec_run` and friends to say "not available", which sends `dsp_run` to the interpreter. |
+| The recompiler does not exist off x86-64 (xbased 1.2.5 itself builds for x86-64 only) | `dsp_rec.cpp`, Zydis and the x86 flags (`-msse4.1 -mpopcnt`) are left out there (`build.rs`, by target arch) and `ffi.rs` defines `dsp_rec_run` and friends to say "not available", which sends `dsp_run` to the interpreter. That is hakuX's arm64 build: the interpreter alone (`dsp_cpu.c`, no recompiler, no Zydis) and no architecture flags. |
 
 Build flags that differ from the reference's `xbased_apu` target: no
 `-flto=thin` (the objects go into a Rust static library), no `-g1`, and the

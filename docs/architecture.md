@@ -72,7 +72,7 @@ Guest physical `0xE000_0000` to `0xE040_5000` is reserved by the KVM backend
 
 ## CPU backends
 
-`xb-cpu` defines the `Cpu` trait. Two backends implement it:
+`xb-cpu` defines the `Cpu` trait. Three backends implement it:
 
 - **`xb-cpu-kvm`** runs the guest in a hardware VM. It is used when `/dev/kvm`
   can be opened read-write and offers what the backend needs; the check is made
@@ -80,14 +80,17 @@ Guest physical `0xE000_0000` to `0xE040_5000` is reserved by the KVM backend
   self-modifying code need no emulation.
 - **`xb-cpu-x64`** translates guest x86-32 code to x86-64 host code. It needs
   nothing from the host OS and is the fallback on x86-64 hosts.
-
-A later backend (interpreter plus a portable JIT) covers arm64 hosts.
+- **`xb-cpu-interp`** interprets guest code in portable Rust, with the
+  guest's page table in software, so it runs on any host, whatever its
+  architecture or page size. On AArch64 macOS it compiles hot blocks to host
+  code. It is the backend of every host the other two do not run on.
 
 `Settings::cpu` chooses: `auto` prefers KVM and falls back to the translator.
+On a host with neither, `auto` and `translator` both mean the interpreter.
 A front end can override the choice for one run (`CoreConfig::cpu_override`)
 without changing what is saved.
 
-The two backends are tested against each other: the same guest code and
+The backends are tested against each other: the same guest code and
 initial context must give the same final context and memory.
 
 ### Kernel entry
@@ -120,6 +123,7 @@ not, the kernel resumes with `RunFlags::exit_when_interruptible`.
 | `xb-cpu` | CPU interface |
 | `xb-cpu-kvm` | KVM backend |
 | `xb-cpu-x64` | translator backend |
+| `xb-cpu-interp` | interpreter backend, with a code generator on AArch64 |
 | `xb-kernel` | kernel exports, objects, scheduler, memory manager |
 | `xb-devices` | OHCI, hub, XID pad, legacy ports, AC'97, NIC stub |
 | `xb-gpu` | NV2A register front end (Rust) and the renderer (vendored C) |

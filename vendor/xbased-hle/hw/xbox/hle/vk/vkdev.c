@@ -296,6 +296,32 @@ int hle_vk_init(void)
         .pApplicationInfo = &app,
         .enabledExtensionCount = nix, .ppEnabledExtensionNames = iexts,
     };
+#if defined(XBEMU_HOST)
+    /* xbemu: a driver of the portability subset (MoltenVK) is listed only to
+     * an instance that asks for those */
+    if (has_ext(iext, nie, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+        iexts[nix++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+        ici.enabledExtensionCount = nix;
+        ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
+#endif
+#if defined(XBEMU_HOST) && defined(__APPLE__)
+    /* xbemu: MoltenVK compiles shaders without fast math, as the reference
+     * runs it, unless MVK_CONFIG_FAST_MATH_ENABLED says otherwise (layer
+     * settings override the environment, so this one is left out then) */
+    const uint32_t mvk_fast_math = 0;   /* MVK_CONFIG_FAST_MATH_NEVER */
+    const VkLayerSettingEXT mvk_set = {
+        .pLayerName = "MoltenVK", .pSettingName = "MVK_CONFIG_FAST_MATH_ENABLED",
+        .type = VK_LAYER_SETTING_TYPE_UINT32_EXT, .valueCount = 1, .pValues = &mvk_fast_math };
+    const VkLayerSettingsCreateInfoEXT mvk_settings = {
+        .sType = VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT,
+        .settingCount = 1, .pSettings = &mvk_set };
+    if (!getenv("MVK_CONFIG_FAST_MATH_ENABLED") && has_ext(iext, nie, VK_EXT_LAYER_SETTINGS_EXTENSION_NAME)) {
+        iexts[nix++] = VK_EXT_LAYER_SETTINGS_EXTENSION_NAME;
+        ici.enabledExtensionCount = nix;
+        ici.pNext = &mvk_settings;
+    }
+#endif
     if (vkCreateInstance(&ici, NULL, &v->inst) != VK_SUCCESS) {
         hle_log("xbased-hle-back", "vk: vkCreateInstance failed");
         snprintf(g_hle_unavailable, sizeof(g_hle_unavailable), "%s", k_no_vulkan);
@@ -487,6 +513,14 @@ int hle_vk_init(void)
     if (e_eds3) chain(&tail, &q_eds3);
     if (e_gpl) chain(&tail, &q_gpl);
     if (e_lr) chain(&tail, &q_lr);
+#if defined(XBEMU_HOST) && defined(VK_KHR_portability_subset)
+    /* xbemu: a portability device's limits (build.rs enables the beta
+     * headers where they are expected), all enabled as they are offered */
+    const bool e_port = has_ext(ext, ne, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR q_port = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR };
+    if (e_port) chain(&tail, &q_port);
+#endif
     vkGetPhysicalDeviceFeatures2(v->phys, &q);
     /* the limits the bindless set and the samplers need (Vulkan 1.2's: a 1.1
      * device fails the floor without them) */
@@ -537,6 +571,12 @@ int hle_vk_init(void)
     c->bindless = ok_rda && ok_pb && ok_uab && ok_nui &&
                   l_img >= 3 * HLE_MAX_IMAGES && l_set_img >= 3 * HLE_MAX_IMAGES &&
                   l_smp >= HLE_MAX_SAMPLERS && l_set_smp >= HLE_MAX_SAMPLERS;
+#if defined(XBEMU_HOST)
+    /* xbemu: no bindless on MoltenVK, as the reference's macOS build */
+    if (v13 && p12.driverID == VK_DRIVER_ID_MOLTENVK) {
+        c->bindless = false;
+    }
+#endif
     need(c, v->props.limits.maxBoundDescriptorSets >= 4, "4 descriptor sets");
     if (v13) {                          /* both required of a 1.3 driver */
         need(c, q13.synchronization2, "synchronization2");
@@ -758,6 +798,22 @@ int hle_vk_init(void)
     if (c->eds3) chain(&tail, &f_eds3);
     if (c->gpl) chain(&tail, &f_gpl);
     if (c->fbfetch) chain(&tail, &f_lr);
+#if defined(XBEMU_HOST) && defined(VK_KHR_portability_subset)
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR f_port = q_port;
+    f_port.pNext = NULL;
+    if (e_port) {
+        chain(&tail, &f_port);
+        hle_log("xbased-hle-back", "vk: portability subset: triangleFans=%d pointPolygons=%d "
+                "samplerMipLodBias=%d separateStencilMaskRef=%d imageViewFormatSwizzle=%d "
+                "imageViewFormatReinterpretation=%d constantAlphaColorBlendFactors=%d events=%d "
+                "mutableComparisonSamplers=%d vertexAttributeAccessBeyondStride=%d",
+                q_port.triangleFans, q_port.pointPolygons, q_port.samplerMipLodBias,
+                q_port.separateStencilMaskRef, q_port.imageViewFormatSwizzle,
+                q_port.imageViewFormatReinterpretation, q_port.constantAlphaColorBlendFactors,
+                q_port.events, q_port.mutableComparisonSamplers,
+                q_port.vertexAttributeAccessBeyondStride);
+    }
+#endif
 
     const char *exts[32];
     uint32_t nx = 0;
@@ -808,6 +864,9 @@ int hle_vk_init(void)
     if (c->swapchain) {
         exts[nx++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     }
+#if defined(XBEMU_HOST) && defined(VK_KHR_portability_subset)
+    if (e_port) exts[nx++] = VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME;  /* xbemu: required where offered */
+#endif
 #ifdef _WIN32
     if (c->share) {
         exts[nx++] = VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME;

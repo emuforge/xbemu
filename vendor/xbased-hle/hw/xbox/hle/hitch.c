@@ -115,7 +115,13 @@ void hle_hitch_thread(int slot)
     memset(h, 0, sizeof(*h));
     h->since = hle_prof_now();
     h->act = HLE_ACT_RUN;
+#if defined(XBEMU_HOST) && defined(__APPLE__)
+    /* xbemu: macOS has no clock for another thread's CPU time; the hitch
+     * reports leave it out */
+    g_h.clk_ok[slot] = false;
+#else
     g_h.clk_ok[slot] = pthread_getcpuclockid(pthread_self(), &g_h.clk[slot]) == 0;
+#endif
 }
 
 void hle_hitch_gpu_done(void)

@@ -23,10 +23,13 @@ xb-cpu = { path = "../xb-cpu" }
 xb-types = { path = "../xb-types" }
 log = "0.4.29"
 
-[target.'cfg(target_arch = "x86_64")'.dependencies]
+[dependencies.iced-x86]
 # MIT. x86 decoder and encoder: guest instructions are decoded as 32-bit code
-# and encoded again for 64-bit mode.
-iced-x86 = { version = "1.22.0", default-features = false, features = ["std", "decoder", "encoder", "instr_info", "intel", "code_asm"] }
+# and encoded again for 64-bit mode; the snippets in `testing` are assembled
+# with it on every target.
+version = "1.22.0"
+default-features = false
+features = ["std", "decoder", "encoder", "instr_info", "intel", "code_asm"]
 
 [target.'cfg(all(target_arch = "x86_64", unix))'.dependencies]
 # MIT OR Apache-2.0. mmap, mprotect, sigaction, arch_prctl.

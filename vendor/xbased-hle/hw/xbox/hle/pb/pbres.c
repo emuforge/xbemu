@@ -531,6 +531,13 @@ enum {
     PT_TRIANGLESTRIP, PT_TRIANGLEFAN, PT_QUADLIST, PT_QUADSTRIP, PT_POLYGON,
     PT_QUADLIST_EDGES, PT_QUADSTRIP_EDGES,      /* pbres.h */
 };
+#if defined(XBEMU_HOST) && defined(__APPLE__)
+/* xbemu: Metal has no triangle fans, and MoltenVK's emulation of them draws
+ * only a fan's first triangle (Halo's intro movie, a full-screen fan, showed
+ * half a picture). Fans and polygons are drawn as triangle lists instead. */
+#define FANS_AS_LISTS 1
+#endif
+
 /* VkPrimitiveTopology (no Vulkan headers here) */
 enum { VT_POINTS = 0, VT_LINES = 1, VT_LINE_STRIP = 2, VT_TRIS = 3, VT_TRI_STRIP = 4,
        VT_TRI_FAN = 5 };
@@ -547,7 +554,12 @@ uint32_t hle_draw_prim_topology(uint32_t pt)
     case PT_TRIANGLESTRIP:
     case PT_QUADSTRIP:     return VT_TRI_STRIP;    /* same vertex order */
     case PT_TRIANGLEFAN:
-    case PT_POLYGON:       return VT_TRI_FAN;
+    case PT_POLYGON:
+#if defined(FANS_AS_LISTS)
+                           return VT_TRIS;   /* xbemu: see FANS_AS_LISTS */
+#else
+                           return VT_TRI_FAN;
+#endif
     default:               return VT_TRIS;         /* lists; quads become triangles */
     }
 }
@@ -560,6 +572,11 @@ uint32_t hle_draw_prim_count(uint32_t pt, uint32_t n)
     if (pt == PT_LINELOOP) {
         return n ? n + 1 : 0;
     }
+#if defined(FANS_AS_LISTS)
+    if (pt == PT_TRIANGLEFAN || pt == PT_POLYGON) {   /* xbemu: see FANS_AS_LISTS */
+        return n >= 3 ? (n - 2) * 3 : 0;
+    }
+#endif
     if (pt == PT_QUADLIST_EDGES) {
         return n / 4 * 8;
     }
@@ -580,6 +597,14 @@ void hle_draw_prim_indices(uint32_t pt, const uint16_t *in, uint32_t n, uint32_t
         }
         return;
     }
+#if defined(FANS_AS_LISTS)
+    if (pt == PT_TRIANGLEFAN || pt == PT_POLYGON) {   /* xbemu: see FANS_AS_LISTS */
+        for (uint32_t i = 1; i + 1 < n; i++) {
+            *out++ = IN(0); *out++ = IN(i); *out++ = IN(i + 1);
+        }
+        return;
+    }
+#endif
     if (pt == PT_QUADLIST_EDGES || pt == PT_QUADSTRIP_EDGES) {
         /* each quad's four sides (a strip's quad i: 2i, 2i + 1, 2i + 3, 2i + 2) */
         const bool st = pt == PT_QUADSTRIP_EDGES;
@@ -600,6 +625,27 @@ void hle_draw_prim_indices(uint32_t pt, const uint16_t *in, uint32_t n, uint32_t
     }
 #undef IN
 }
+
+#if defined(XBEMU_HOST)
+/* xbemu: the primitives hle_draw_prim_indices rewrites */
+bool hle_draw_prim_converted(uint32_t pt)
+{
+    switch (pt) {
+    case PT_QUADLIST:
+    case PT_LINELOOP:
+    case PT_QUADLIST_EDGES:
+    case PT_QUADSTRIP_EDGES:
+        return true;
+#if defined(FANS_AS_LISTS)
+    case PT_TRIANGLEFAN:
+    case PT_POLYGON:
+        return true;
+#endif
+    default:
+        return false;
+    }
+}
+#endif
 
 /* ---- render targets ---------------------------------------------------------------- */
 

@@ -429,7 +429,10 @@ impl AudioSink for NullSink {
         let (ring, stop_flag) = (self.ring.clone(), stop.clone());
         let thread = thread::Builder::new()
             .name("apu.drain".into())
-            .spawn(move || drain_thread(&ring, period, &stop_flag))
+            .spawn(move || {
+                xb_types::thread::pacing();
+                drain_thread(&ring, period, &stop_flag);
+            })
             .map_err(|e| format!("the drain thread did not start: {e}"))?;
         if let Ok(mut d) = self.drain.lock() {
             *d = Some(Drain { stop, thread });

@@ -4,7 +4,7 @@
 //! virtualization: the title's code is translated block by block into host
 //! code that runs in this process. It is the fallback when `xb-cpu-kvm` is
 //! unavailable and is built on every x86-64 Linux host. On other targets the
-//! crate is empty.
+//! crate holds only `testing`, the guest-code snippets every backend runs.
 //!
 //! The scheme is described in `docs/hw/cpu-x64.md`; in one paragraph:
 //!
@@ -46,7 +46,7 @@ pub use cpu::{Stats, X64Cpu};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use translate::DescriptorTables;
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux", any(test, feature = "testing")))]
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod tests;

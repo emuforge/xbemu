@@ -10,6 +10,9 @@
 //! The test prints how far it got and compares the `fs` lines with the
 //! reference's `xbased-native-io:` lines.
 
+// The KVM backend exists on Linux x86-64 only.
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+
 mod common;
 
 use std::sync::atomic::Ordering;

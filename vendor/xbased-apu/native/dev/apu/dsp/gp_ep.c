@@ -861,7 +861,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_
              * program the core can't finish (an instruction it lacks) no
              * longer holds the APU's thread */
             d->gp.dsp->save_cycles = 0;
-#if defined(XBEMU_HOST)
+#if defined(XBEMU_HOST) && defined(__x86_64__) /* xbemu: the stats count TSC ticks */
             static int tstats = -1;
             static int64_t t_gp, n_gp;
             if (tstats < 0) {
@@ -878,7 +878,7 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_
             const uint64_t gtsc0 = tstats ? __rdtsc() : 0;
 #endif
             dsp_run(d->gp.dsp, 16 * GP_FRAME_CYCLES);
-#if defined(XBEMU_HOST)
+#if defined(XBEMU_HOST) && defined(__x86_64__)
             if (tstats) {
                 clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
                 t_gp += ts.tv_sec * 1000000000ll + ts.tv_nsec - t0;

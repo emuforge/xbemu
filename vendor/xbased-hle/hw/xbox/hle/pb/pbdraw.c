@@ -4561,8 +4561,12 @@ static void draw_arrays(void)
      * snowy town as ~17k short strips a frame, which as indexed draws went to
      * the GPU one by one at ~1.7 us each, and the frame took the GPU 30 ms
      * at 2x (26 fps; 30 at 3x in D3D mode, whose strips were joined). */
+#if defined(XBEMU_HOST)
+    if (hi - lo + 1 == n && !hle_draw_prim_converted(pt)) {   /* xbemu: fans on Apple hosts */
+#else
     if (hi - lo + 1 == n && pt != NV2A_PRIM_QUADS && pt != NV2A_PRIM_LINE_LOOP &&
         pt != HLE_PT_QUADLIST_EDGES && pt != HLE_PT_QUADSTRIP_EDGES) {
+#endif
         bool seq = true;
         for (uint32_t i = 0; i < n && seq; i++) {
             seq = g_pd.idx[i] == lo + i;
@@ -4589,8 +4593,12 @@ static void draw_arrays(void)
         skip(SK_DRAW_ARRAYS_ARENA2);
         return;
     }
+#if defined(XBEMU_HOST)
+    if (hle_draw_prim_converted(pt)) {   /* xbemu: fans on Apple hosts */
+#else
     if (pt == NV2A_PRIM_QUADS || pt == NV2A_PRIM_LINE_LOOP || pt == HLE_PT_QUADLIST_EDGES ||
         pt == HLE_PT_QUADSTRIP_EDGES) {
+#endif
         for (uint32_t i = 0; i < n; i++) {
             g_pd.idx16[i] = (uint16_t)(g_pd.idx[i] - lo);
         }

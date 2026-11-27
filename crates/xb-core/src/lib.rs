@@ -31,6 +31,7 @@
 
 mod bus;
 mod guest;
+mod host;
 mod machine;
 mod pacing;
 mod script;
@@ -53,6 +54,10 @@ pub use xb_apu::{
     AudioSink, Channels, DrainSignal, NullSink, RingSink, RingSource, StreamSpec, ring_sink,
 };
 pub use xb_gpu::{DrawStats, SurfaceProvider, VkInstance, VkSurfaceKHR};
+/// Where the renderer looks for the Vulkan library on macOS; a front end
+/// that creates the window's surface itself looks in the same order.
+#[cfg(target_os = "macos")]
+pub use xb_gpu::vulkan_libraries;
 pub use xb_types::pad::{self, PORTS, PadState, Rumble};
 pub use xb_types::settings::{Aspect, CpuBackend, Settings};
 
@@ -303,6 +308,10 @@ impl Core {
     /// lacks something the core needs (a Vulkan device, a CPU backend).
     pub fn boot(config: CoreConfig) -> Result<Self, BootError> {
         let err = |what: &str, e: &dyn std::fmt::Display| BootError(format!("{what}: {e}"));
+        // The machine's threads ask the host for their class as they start;
+        // this one presents the picture (`Core::frame` runs on it).
+        host::install();
+        xb_types::thread::pacing();
         let data_dir = config.data_dir;
         let hdd_root = data_dir.join("hdd");
         let cache_dir = data_dir.join("cache");
@@ -339,7 +348,10 @@ impl Core {
         let (tx, rx) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("guest-cpu".into())
-            .spawn(move || guest::thread_main(build, &tx))
+            .spawn(move || {
+                xb_types::thread::pacing();
+                guest::thread_main(build, &tx);
+            })
             .map_err(|e| err("cannot start the guest CPU thread", &e))?;
         let booted = match rx.recv() {
             Ok(Ok(booted)) => booted,

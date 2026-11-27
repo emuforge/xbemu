@@ -21,6 +21,17 @@ ash-window = "0.13.0"
 gilrs = "0.11.2"
 cpal = "0.18.2"
 
+# MIT OR Apache-2.0 (already in the tree through ash-window). The window's
+# CAMetalLayer, made on the main thread as AppKit requires (surface.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+raw-window-metal = "0.4.0"
+# MIT. The Open panel that asks for a disc when the app is started without
+# one (picker.rs); version 0.3 of the bindings winit uses, whose panel calls
+# are safe.
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSString", "NSURL"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSWindow", "NSResponder", "NSApplication", "NSRunningApplication"] }
+
 # PipeWire and PulseAudio desktops are reached through cpal's PulseAudio host
 # (a Rust implementation of the protocol; no system library). Their ALSA
 # "default" device is often the bare hardware, which the sound server holds.

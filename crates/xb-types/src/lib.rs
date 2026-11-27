@@ -10,6 +10,7 @@ pub mod mem;
 pub mod pad;
 pub mod settings;
 pub mod state;
+pub mod thread;
 
 /// Size of a guest page. The Xbox's Pentium III uses 4 KiB pages (4 MiB large
 /// pages exist only in the kernel's own mappings, which this core models as

@@ -50,13 +50,20 @@ void apu_cond_init(pthread_cond_t *c)
 {
     pthread_condattr_t a;
     pthread_condattr_init(&a);
+#if !(defined(XBEMU_HOST) && defined(__APPLE__)) /* xbemu: no setclock on macOS */
     pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
+#endif
     pthread_cond_init(c, &a);
     pthread_condattr_destroy(&a);
 }
 
 bool apu_cond_timedwait_us(pthread_cond_t *c, pthread_mutex_t *m, int64_t us)
 {
+#if defined(XBEMU_HOST) && defined(__APPLE__)
+    /* xbemu: macOS waits relative to now, on a monotonic clock */
+    const struct timespec rel = { (time_t)(us / 1000000), (long)(us % 1000000) * 1000L };
+    return pthread_cond_timedwait_relative_np(c, m, &rel) == 0;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     ts.tv_sec += us / 1000000;
@@ -66,12 +73,28 @@ bool apu_cond_timedwait_us(pthread_cond_t *c, pthread_mutex_t *m, int64_t us)
         ts.tv_sec++;
     }
     return pthread_cond_timedwait(c, m, &ts) == 0;
+#endif
 }
 
 bool apu_cond_timedwait_ms(pthread_cond_t *c, pthread_mutex_t *m, int ms)
 {
     return apu_cond_timedwait_us(c, m, (int64_t)ms * 1000);
 }
+
+#if defined(XBEMU_HOST) && defined(__APPLE__)
+/* xbemu: macOS names only the calling thread, so the new thread names itself */
+struct apu_named_start { void *(*fn)(void *); void *arg; char name[16]; };
+static void *apu_named_start(void *p)
+{
+    struct apu_named_start s = *(struct apu_named_start *)p;
+    free(p);
+    pthread_setname_np(s.name);
+    /* xbemu: the emulation's threads ask for the class the scheduler keeps
+     * on the performance cores; a new thread starts at the default class */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    return s.fn(s.arg);
+}
+#endif
 
 /* The device code was written for desktop stacks (8 MiB); bionic's default
  * is 1 MiB. */
@@ -80,11 +103,20 @@ void apu_thread_start(pthread_t *t, const char *name, void *(*fn)(void *), void 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 8u << 20);
+#if defined(XBEMU_HOST) && defined(__APPLE__) /* xbemu: see apu_named_start */
+    struct apu_named_start *s = malloc(sizeof(*s));
+    s->fn = fn;
+    s->arg = arg;
+    snprintf(s->name, sizeof(s->name), "%s", name);
+    pthread_create(t, &attr, apu_named_start, s);
+    pthread_attr_destroy(&attr);
+#else
     pthread_create(t, &attr, fn, arg);
     pthread_attr_destroy(&attr);
     char n[16];
     snprintf(n, sizeof(n), "%s", name);
     pthread_setname_np(*t, n);
+#endif
     if (!joinable) {
         pthread_detach(*t);
     }

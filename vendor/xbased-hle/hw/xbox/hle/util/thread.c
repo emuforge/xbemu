@@ -11,10 +11,29 @@ static void monotonic_cond_init(pthread_cond_t *c)
 {
     pthread_condattr_t a;
     pthread_condattr_init(&a);
+#if !(defined(XBEMU_HOST) && defined(__APPLE__)) /* xbemu: no setclock on macOS: see abs_wait */
     pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
+#endif
     pthread_cond_init(c, &a);
     pthread_condattr_destroy(&a);
 }
+
+#if defined(XBEMU_HOST) && defined(__APPLE__)
+/* xbemu: macOS's condition variables wait relative to now (on a monotonic
+ * clock); a monotonic deadline becomes the time left to it */
+static int abs_wait(pthread_cond_t *c, pthread_mutex_t *m, const struct timespec *ts)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t left = (int64_t)(ts->tv_sec - now.tv_sec) * 1000000000LL + (ts->tv_nsec - now.tv_nsec);
+    if (left < 0) {
+        left = 0;
+    }
+    const struct timespec rel = { (time_t)(left / 1000000000LL), (long)(left % 1000000000LL) };
+    return pthread_cond_timedwait_relative_np(c, m, &rel);
+}
+#define pthread_cond_timedwait abs_wait
+#endif
 
 void hle_cond_init(HleCond *c)
 {
@@ -39,6 +58,42 @@ bool hle_cond_timedwait(HleCond *c, HleMutex *m, int ms)
     return pthread_cond_timedwait(&c->c, &m->m, &ts) == 0;
 }
 
+#if defined(XBEMU_HOST) && defined(__APPLE__)
+/* xbemu: dispatch semaphores. Made at 0 and posted up to `init`: one freed
+ * below the value it was made with is a fault. */
+void hle_sem_init(HleSem *s, int init)
+{
+    s->s = dispatch_semaphore_create(0);
+    for (int i = 0; i < init; i++) {
+        dispatch_semaphore_signal(s->s);
+    }
+}
+
+void hle_sem_destroy(HleSem *s)
+{
+    dispatch_release(s->s);
+}
+
+void hle_sem_post(HleSem *s)
+{
+    dispatch_semaphore_signal(s->s);
+}
+
+void hle_sem_wait(HleSem *s)
+{
+    dispatch_semaphore_wait(s->s, DISPATCH_TIME_FOREVER);
+}
+
+bool hle_sem_trywait(HleSem *s)
+{
+    return dispatch_semaphore_wait(s->s, DISPATCH_TIME_NOW) == 0;
+}
+
+bool hle_sem_timedwait(HleSem *s, int ms)
+{
+    return dispatch_semaphore_wait(s->s, dispatch_time(DISPATCH_TIME_NOW, (int64_t)ms * 1000000)) == 0;
+}
+#else
 void hle_sem_init(HleSem *s, int init)
 {
     sem_init(&s->s, 0, (unsigned)init);
@@ -80,6 +135,7 @@ bool hle_sem_timedwait(HleSem *s, int ms)
     }
     return r == 0;
 }
+#endif
 
 void hle_event_init(HleEvent *e, bool set)
 {
@@ -155,11 +211,43 @@ bool hle_event_timedwait_us(HleEvent *e, int64_t us)
     return set;
 }
 
+#if defined(XBEMU_HOST) && defined(__APPLE__)
+/* xbemu: macOS names only the calling thread, so a new thread names itself */
+typedef struct NamedStart {
+    void *(*fn)(void *);
+    void *arg;
+    char name[16];
+} NamedStart;
+
+static void *named_start(void *p)
+{
+    NamedStart s = *(NamedStart *)p;
+    free(p);
+    pthread_setname_np(s.name);
+    /* xbemu: the emulation's threads ask for the class the scheduler keeps
+     * on the performance cores; a new thread starts at the default class */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    return s.fn(s.arg);
+}
+#endif
+
 void hle_thread_create(HleThread *t, const char *name, void *(*fn)(void *), void *arg, int mode)
 {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 8u << 20);
+#if defined(XBEMU_HOST) && defined(__APPLE__) /* xbemu: see named_start */
+    NamedStart *s = name ? malloc(sizeof(*s)) : NULL;
+    if (s) {
+        s->fn = fn;
+        s->arg = arg;
+        snprintf(s->name, sizeof(s->name), "%s", name);
+        pthread_create(&t->t, &attr, named_start, s);
+    } else {
+        pthread_create(&t->t, &attr, fn, arg);
+    }
+    pthread_attr_destroy(&attr);
+#else
     pthread_create(&t->t, &attr, fn, arg);
     pthread_attr_destroy(&attr);
     if (name) {
@@ -167,6 +255,7 @@ void hle_thread_create(HleThread *t, const char *name, void *(*fn)(void *), void
         snprintf(n, sizeof(n), "%s", name);
         pthread_setname_np(t->t, n);
     }
+#endif
     if (mode == HLE_THREAD_DETACHED) {
         pthread_detach(t->t);
     }
@@ -195,6 +284,9 @@ static pthread_once_t g_tonce = PTHREAD_ONCE_INIT;
 
 static void *timer_thread(void *arg)
 {
+#if defined(XBEMU_HOST) && defined(__APPLE__)
+    pthread_setname_np("hle-timers");
+#endif
     pthread_mutex_lock(&g_tm);
     for (;;) {
         int64_t now = hle_now_ms(), next = INT64_MAX;
@@ -230,7 +322,9 @@ static void timers_start(void)
     monotonic_cond_init(&g_tc);
     pthread_t t;
     pthread_create(&t, NULL, timer_thread, NULL);
+#if !(defined(XBEMU_HOST) && defined(__APPLE__)) /* xbemu: timer_thread names itself */
     pthread_setname_np(t, "hle-timers");
+#endif
     pthread_detach(t);
 }
 

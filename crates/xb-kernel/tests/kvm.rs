@@ -6,6 +6,9 @@
 //!
 //! Each test prints a note and passes when KVM cannot be used on the host.
 
+// The KVM backend exists on Linux x86-64 only.
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+
 mod common;
 
 use std::sync::Arc;

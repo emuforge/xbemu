@@ -19,9 +19,17 @@ typedef struct HleCond {
     pthread_cond_t c;
 } HleCond;
 
+#if defined(XBEMU_HOST) && defined(__APPLE__)
+/* xbemu: macOS has no unnamed POSIX semaphores (sem_init fails) */
+#include <dispatch/dispatch.h>
+typedef struct HleSem {
+    dispatch_semaphore_t s;
+} HleSem;
+#else
 typedef struct HleSem {
     sem_t s;
 } HleSem;
+#endif
 
 /* Set / reset by hand; waiters wait for "set". */
 typedef struct HleEvent {

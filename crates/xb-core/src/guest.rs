@@ -83,8 +83,16 @@ fn make_cpu(choice: CpuBackend, ram: &Ram) -> Result<Box<dyn Cpu>, String> {
     }
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     {
-        let _ = (choice, ram);
-        Err("no CPU backend exists for this host yet".into())
+        // The interpreter is the one backend on this host: it stands in for
+        // the translator.
+        use xb_cpu_interp::InterpCpu;
+        match choice {
+            CpuBackend::Kvm => Err("KVM was asked for but exists on Linux x86-64 only".into()),
+            CpuBackend::Auto | CpuBackend::Translator => {
+                log::info!(target: "core", "cpu: the interpreter (the only backend on this host)");
+                Ok(Box::new(InterpCpu::new(ram.clone())))
+            }
+        }
     }
 }
 
