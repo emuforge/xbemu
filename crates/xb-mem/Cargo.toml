@@ -1,0 +1,21 @@
+[package]
+name = "xb-mem"
+description = "Guest physical RAM, the guest address space's page table, and write tracking."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+xb-types = { path = "../xb-types" }
+log = "0.4.29"
+
+# The shared memory object and its mapping (memfd_create, mmap). MIT OR Apache-2.0.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.190"

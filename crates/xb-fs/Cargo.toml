@@ -1,0 +1,26 @@
+[package]
+name = "xb-fs"
+description = "The Xbox I/O namespace over host storage: disc, hard disk partitions, files and directories."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+xb-types = { path = "../xb-types" }
+log = "0.4"
+
+# Free space of the file system under the hard disk folder (statvfs); std has
+# no portable call for it.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
+
+[dev-dependencies]
+# The titles stash: finds the reference log a developer has linked in.
+xb-testkit = { path = "../xb-testkit" }
