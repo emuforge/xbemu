@@ -389,8 +389,20 @@ impl<D: Decoder, C: Clock> Nv2a<D, C> {
     /// PUT, GET, REF or the mode. Repeats until what it stored agrees with
     /// what the registers say, so two racing calls cannot leave a stale
     /// answer behind.
+    ///
+    /// A register is written only when its value changes. The decoder
+    /// publishes GET at every packet of the push buffer, tens of thousands of
+    /// times a frame, and of the six registers kept here only the view of GET
+    /// differs from one of those to the next: the others' stores, one of
+    /// them a locked exchange, took the pages' cache lines from the guest's
+    /// CPU each time for nothing.
     fn refresh_fifo(&self) {
         let r = &self.regs;
+        let keep = |off: u32, v: u32| {
+            if r.load(off) != v {
+                r.store(off, v);
+            }
+        };
         loop {
             let seen = (
                 self.pb_mode(),
@@ -401,15 +413,17 @@ impl<D: Decoder, C: Clock> Nv2a<D, C> {
             let (pb, put, get, rf) = seen;
             let empty = !pb || put == get;
             let status = if empty { reg::PFIFO_LOW_MARK } else { 0 };
-            r.store(reg::PFIFO_RUNOUT_STATUS, status);
-            r.store(reg::PFIFO_CACHE1_STATUS, status);
-            r.update(reg::PFIFO_CACHE1_DMA_PUSH, |v| {
-                if empty { v & !reg::PFIFO_DMA_BUSY } else { v | reg::PFIFO_DMA_BUSY }
-            });
+            keep(reg::PFIFO_RUNOUT_STATUS, status);
+            keep(reg::PFIFO_CACHE1_STATUS, status);
+            if (r.load(reg::PFIFO_CACHE1_DMA_PUSH) & reg::PFIFO_DMA_BUSY == 0) != empty {
+                r.update(reg::PFIFO_CACHE1_DMA_PUSH, |v| {
+                    if empty { v & !reg::PFIFO_DMA_BUSY } else { v | reg::PFIFO_DMA_BUSY }
+                });
+            }
             if pb {
-                r.store(reg::USER_DMA_PUT, put);
-                r.store(reg::USER_DMA_GET, get);
-                r.store(reg::USER_REF, rf);
+                keep(reg::USER_DMA_PUT, put);
+                keep(reg::USER_DMA_GET, get);
+                keep(reg::USER_REF, rf);
             }
             let now = (
                 self.pb_mode(),
@@ -1042,6 +1056,48 @@ pub(crate) mod tests {
         r.nv.gpu_reg_set(reg::PFIFO_CACHE1_DMA_GET, 0x200);
         assert_eq!(r.nv.mmio_read(reg::PFIFO_CACHE1_STATUS, 1), reg::PFIFO_LOW_MARK);
         assert_eq!(r.nv.mmio_read(reg::PFIFO_CACHE1_DMA_PUSH, 4) & reg::PFIFO_DMA_BUSY, 0);
+    }
+
+    #[test]
+    fn the_register_file_holds_what_the_fifos_computed_registers_read_as() {
+        // A backend that maps the pages reads the file, not `mmio_read`: the
+        // two agree after every step of a push buffer being filled and
+        // consumed, a step that changes nothing included.
+        let r = rig();
+        let computed = [
+            reg::PFIFO_RUNOUT_STATUS,
+            reg::PFIFO_CACHE1_STATUS,
+            reg::PFIFO_CACHE1_DMA_PUSH,
+            reg::USER_DMA_PUT,
+            reg::USER_DMA_GET,
+            reg::USER_REF,
+        ];
+        let agree = |step: &str| {
+            for off in computed {
+                assert_eq!(r.nv.gpu_reg(off), r.nv.mmio_read(off, 4), "{off:#08x} after {step}");
+            }
+        };
+        r.nv.set_pb_mode(true);
+        agree("the decoder takes the FIFO");
+        r.nv.mmio_write(reg::USER_DMA_PUT, 4, 0x300);
+        agree("a PUT");
+        for get in [0x100, 0x100, 0x200, 0x300, 0x300] {
+            r.nv.gpu_reg_set(reg::PFIFO_CACHE1_DMA_GET, get);
+            agree("a GET");
+        }
+        r.nv.gpu_reg_set(reg::PFIFO_CACHE1_REF, 7);
+        agree("a REF");
+        r.nv.mmio_write(reg::USER_DMA_PUT, 4, 0x400);
+        agree("a PUT past an empty FIFO");
+        r.nv.set_pb_mode(false);
+        for off in [reg::PFIFO_RUNOUT_STATUS, reg::PFIFO_CACHE1_STATUS, reg::PFIFO_CACHE1_DMA_PUSH]
+        {
+            assert_eq!(
+                r.nv.gpu_reg(off),
+                r.nv.mmio_read(off, 4),
+                "{off:#08x} with the FIFO given back"
+            );
+        }
     }
 
     #[test]
