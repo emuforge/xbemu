@@ -1,0 +1,374 @@
+//! Hand-assembled 32-bit guest code for the backend cases.
+//!
+//! Each constant is position dependent: it is assembled to run at
+//! [`CODE_VA`](super::CODE_VA) and refers to the other layout constants of
+//! [`testing`](super) by value. The listing in each comment is the source
+//! (NASM syntax); the bytes were checked against NASM's output.
+
+/// A loop and arithmetic: sums 1..=100, multiplies, shifts.
+///
+/// ```text
+///     mov ecx, 100
+///     xor eax, eax
+/// .l: add eax, ecx
+///     dec ecx
+///     jnz .l
+///     imul eax, eax, 3
+///     mov edx, eax
+///     shr edx, 4
+///     sub eax, 7
+///     ret
+/// ```
+pub const ARITH: &[u8] = &[
+    0xB9, 0x64, 0x00, 0x00, 0x00, 0x31, 0xC0, 0x01, 0xC8, 0x49, 0x75, 0xFB, 0x6B, 0xC0, 0x03, 0x89,
+    0xC2, 0xC1, 0xEA, 0x04, 0x83, 0xE8, 0x07, 0xC3,
+];
+
+/// A kernel call through an import slot with every register loaded.
+///
+/// ```text
+///     mov eax, 0x11111111
+///     mov ecx, 0x22222222
+///     mov edx, 0x33333333
+///     mov ebx, 0x44444444
+///     mov ebp, 0x55555555
+///     mov esi, 0x66666666
+///     mov edi, 0x77777777
+///     push 0x1234
+///     call [imp]
+///     add eax, 1
+///     ret
+///     align 4
+/// imp: dd TRAP + 0x123
+/// ```
+pub const TRAP_CALL: &[u8] = &[
+    0xB8, 0x11, 0x11, 0x11, 0x11, 0xB9, 0x22, 0x22, 0x22, 0x22, 0xBA, 0x33, 0x33, 0x33, 0x33, 0xBB,
+    0x44, 0x44, 0x44, 0x44, 0xBD, 0x55, 0x55, 0x55, 0x55, 0xBE, 0x66, 0x66, 0x66, 0x66, 0xBF, 0x77,
+    0x77, 0x77, 0x77, 0x68, 0x34, 0x12, 0x00, 0x00, 0xFF, 0x15, 0x34, 0x00, 0x01, 0x00, 0x83, 0xC0,
+    0x01, 0xC3, 0x90, 0x90, 0x23, 0x01, 0x00, 0xFA,
+];
+
+/// Loads x87 and SSE registers from memory at ESI.
+///
+/// ```text
+///     fld qword [esi]
+///     movups xmm3, [esi + 8]
+///     ret
+/// ```
+pub const FX_LOAD: &[u8] = &[0xDD, 0x06, 0x0F, 0x10, 0x5E, 0x08, 0xC3];
+
+/// Stores x87 and SSE registers to memory at EDI.
+///
+/// ```text
+///     fstp qword [edi]
+///     movups [edi + 8], xmm3
+///     movups [edi + 24], xmm5
+///     ret
+/// ```
+pub const FX_STORE: &[u8] = &[0xDD, 0x1F, 0x0F, 0x11, 0x5F, 0x08, 0x0F, 0x11, 0x6F, 0x18, 0xC3];
+
+/// Device register reads and writes of every size.
+///
+/// ```text
+///     mov esi, MMIO
+///     mov al, [esi + 0x10]
+///     mov bx, [esi + 0x20]
+///     mov ecx, [esi + 0x30]
+///     mov byte [esi + 0x40], 0x5A
+///     mov word [esi + 0x50], 0xBEEF
+///     mov dword [esi + 0x60], 0x12345678
+///     mov [esi + 0x70], ecx
+///     ret
+/// ```
+pub const MMIO: &[u8] = &[
+    0xBE, 0x00, 0x00, 0x00, 0xFD, 0x8A, 0x46, 0x10, 0x66, 0x8B, 0x5E, 0x20, 0x8B, 0x4E, 0x30, 0xC6,
+    0x46, 0x40, 0x5A, 0x66, 0xC7, 0x46, 0x50, 0xEF, 0xBE, 0xC7, 0x46, 0x60, 0x78, 0x56, 0x34, 0x12,
+    0x89, 0x4E, 0x70, 0xC3,
+];
+
+/// `REP MOVSD` from RAM at ESI into device registers.
+///
+/// ```text
+///     mov edi, MMIO + 0x100
+///     mov ecx, 3
+///     cld
+///     rep movsd
+///     ret
+/// ```
+pub const MMIO_REP: &[u8] =
+    &[0xBF, 0x00, 0x01, 0x00, 0xFD, 0xB9, 0x03, 0x00, 0x00, 0x00, 0xFC, 0xF3, 0xA5, 0xC3];
+
+/// `IN` and `OUT` of every size, immediate and DX forms.
+///
+/// ```text
+///     mov al, 0x12
+///     out 0x80, al
+///     mov dx, 0xC000
+///     mov eax, 0xAABBCCDD
+///     out dx, eax
+///     out dx, ax
+///     in al, 0x60
+///     mov bl, al
+///     in ax, dx
+///     mov cx, ax
+///     in eax, dx
+///     ret
+/// ```
+pub const PORT_IO: &[u8] = &[
+    0xB0, 0x12, 0xE6, 0x80, 0x66, 0xBA, 0x00, 0xC0, 0xB8, 0xDD, 0xCC, 0xBB, 0xAA, 0xEF, 0x66, 0xEF,
+    0xE4, 0x60, 0x88, 0xC3, 0x66, 0xED, 0x66, 0x89, 0xC1, 0xED, 0xC3,
+];
+
+/// `REP OUTSB` of four bytes at ESI.
+///
+/// ```text
+///     mov ecx, 4
+///     mov dx, 0x3F8
+///     cld
+///     rep outsb
+///     ret
+/// ```
+pub const PORT_STRING: &[u8] =
+    &[0xB9, 0x04, 0x00, 0x00, 0x00, 0x66, 0xBA, 0xF8, 0x03, 0xFC, 0xF3, 0x6E, 0xC3];
+
+/// Writes then reads an address that starts out unmapped.
+///
+/// ```text
+///     mov eax, 0x1111
+///     mov [UNMAPPED + 4], eax
+///     mov ebx, [UNMAPPED + 4]
+///     ret
+/// ```
+pub const FAULT: &[u8] = &[
+    0xB8, 0x11, 0x11, 0x00, 0x00, 0xA3, 0x04, 0x00, 0x00, 0x40, 0x8B, 0x1D, 0x04, 0x00, 0x00, 0x40,
+    0xC3,
+];
+
+/// Writes a constant to the dword at EDI.
+///
+/// ```text
+///     mov dword [edi], 0x2222
+///     ret
+/// ```
+pub const STORE: &[u8] = &[0xC7, 0x07, 0x22, 0x22, 0x00, 0x00, 0xC3];
+
+/// Reads the dword at ESI.
+///
+/// ```text
+///     mov eax, [esi]
+///     ret
+/// ```
+pub const LOAD: &[u8] = &[0x8B, 0x06, 0xC3];
+
+/// Increments the dword at EDI until the dword at ESI is nonzero.
+///
+/// ```text
+/// .l: inc dword [edi]
+///     cmp dword [esi], 0
+///     je .l
+///     ret
+/// ```
+pub const COUNT: &[u8] = &[0xFF, 0x07, 0x83, 0x3E, 0x00, 0x74, 0xF9, 0xC3];
+
+/// Loops forever.
+///
+/// ```text
+///     jmp $
+/// ```
+pub const SPIN: &[u8] = &[0xEB, 0xFE];
+
+/// Enables interrupts, then counts in EBX forever.
+///
+/// ```text
+///     mov eax, 1
+///     sti
+/// .l: inc ebx
+///     jmp .l
+/// ```
+pub const STI: &[u8] = &[0xB8, 0x01, 0x00, 0x00, 0x00, 0xFB, 0x43, 0xEB, 0xFD];
+
+/// Halts between two register loads.
+///
+/// ```text
+///     mov eax, 7
+///     hlt
+///     mov eax, 9
+///     ret
+/// ```
+pub const HLT: &[u8] = &[0xB8, 0x07, 0x00, 0x00, 0x00, 0xF4, 0xB8, 0x09, 0x00, 0x00, 0x00, 0xC3];
+
+/// A software interrupt with the carry flag set across it.
+///
+/// ```text
+///     stc
+///     mov eax, 0x33
+///     int 0x2e
+///     adc eax, 0
+///     ret
+/// ```
+pub const INT_2E: &[u8] = &[0xF9, 0xB8, 0x33, 0x00, 0x00, 0x00, 0xCD, 0x2E, 0x83, 0xD0, 0x00, 0xC3];
+
+/// A breakpoint.
+///
+/// ```text
+///     int3
+///     ret
+/// ```
+pub const INT3: &[u8] = &[0xCC, 0xC3];
+
+/// `INT 13`: a software interrupt on a vector whose fault has an error code.
+///
+/// ```text
+///     int 0x0d
+///     ret
+/// ```
+pub const INT_0D: &[u8] = &[0xCD, 0x0D, 0xC3];
+
+/// Divides by zero.
+///
+/// ```text
+///     mov eax, 5
+///     xor edx, edx
+///     xor ecx, ecx
+///     div ecx
+///     ret
+/// ```
+pub const DIVIDE: &[u8] = &[0xB8, 0x05, 0x00, 0x00, 0x00, 0x31, 0xD2, 0x31, 0xC9, 0xF7, 0xF1, 0xC3];
+
+/// An undefined opcode.
+///
+/// ```text
+///     ud2
+///     ret
+/// ```
+pub const UD2: &[u8] = &[0x0F, 0x0B, 0xC3];
+
+/// Loads DS with a selector past the end of the GDT (#GP with an error code).
+///
+/// ```text
+///     mov eax, 0x33
+///     mov ds, eax
+///     ret
+/// ```
+pub const BAD_SELECTOR: &[u8] = &[0xB8, 0x33, 0x00, 0x00, 0x00, 0x8E, 0xD8, 0xC3];
+
+/// Reads the time-stamp counter.
+///
+/// ```text
+///     rdtsc
+///     ret
+/// ```
+pub const RDTSC: &[u8] = &[0x0F, 0x31, 0xC3];
+
+/// Reads and writes through FS.
+///
+/// ```text
+///     mov eax, [fs:0x28]
+///     add eax, 1
+///     mov [fs:0x2c], eax
+///     ret
+/// ```
+pub const FS: &[u8] = &[
+    0x64, 0xA1, 0x28, 0x00, 0x00, 0x00, 0x83, 0xC0, 0x01, 0x64, 0xA3, 0x2C, 0x00, 0x00, 0x00, 0xC3,
+];
+
+/// Saves and reloads FS, then reads through it.
+///
+/// ```text
+///     push fs
+///     pop fs
+///     mov eax, [fs:0x28]
+///     ret
+/// ```
+pub const FS_RELOAD: &[u8] = &[0x0F, 0xA0, 0x0F, 0xA1, 0x64, 0xA1, 0x28, 0x00, 0x00, 0x00, 0xC3];
+
+/// Patches the immediate of an instruction it then runs again.
+///
+/// ```text
+///     xor ebx, ebx
+///     mov ecx, 2
+/// .l: mov eax, 1
+///     add ebx, eax
+///     mov dword [.l + 1], 0x100
+///     dec ecx
+///     jnz .l
+///     ret
+/// ```
+pub const SMC: &[u8] = &[
+    0x31, 0xDB, 0xB9, 0x02, 0x00, 0x00, 0x00, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x01, 0xC3, 0xC7, 0x05,
+    0x08, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x49, 0x75, 0xEC, 0xC3,
+];
+
+/// Reads one virtual address three times, halting in between.
+///
+/// ```text
+///     mov eax, [UNMAPPED]
+///     hlt
+///     mov ebx, [UNMAPPED]
+///     hlt
+///     mov ecx, [UNMAPPED]
+///     ret
+/// ```
+pub const REMAP: &[u8] = &[
+    0xA1, 0x00, 0x00, 0x00, 0x40, 0xF4, 0x8B, 0x1D, 0x00, 0x00, 0x00, 0x40, 0xF4, 0x8B, 0x0D, 0x00,
+    0x00, 0x00, 0x40, 0xC3,
+];
+
+/// Vendor leaf, then the signature and feature leaf.
+///
+/// ```text
+///     xor eax, eax
+///     cpuid
+///     mov esi, ebx
+///     mov eax, 1
+///     cpuid
+///     ret
+/// ```
+pub const CPUID: &[u8] =
+    &[0x31, 0xC0, 0x0F, 0xA2, 0x89, 0xDE, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x0F, 0xA2, 0xC3];
+
+/// Reads and writes a model-specific register no processor defines.
+///
+/// ```text
+///     mov ecx, 0xABC
+///     rdmsr
+///     mov esi, eax
+///     mov edi, edx
+///     mov eax, 0x1111
+///     mov edx, 0x2222
+///     wrmsr
+///     ret
+/// ```
+pub const MSR: &[u8] = &[
+    0xB9, 0xBC, 0x0A, 0x00, 0x00, 0x0F, 0x32, 0x89, 0xC6, 0x89, 0xD7, 0xB8, 0x11, 0x11, 0x00, 0x00,
+    0xBA, 0x22, 0x22, 0x00, 0x00, 0x0F, 0x30, 0xC3,
+];
+
+/// `REP MOVSD` from device registers into RAM at EDI.
+///
+/// ```text
+///     mov esi, MMIO + 0x200
+///     mov ecx, 3
+///     cld
+///     rep movsd
+///     ret
+/// ```
+pub const MMIO_REP_IN: &[u8] =
+    &[0xBE, 0x00, 0x02, 0x00, 0xFD, 0xB9, 0x03, 0x00, 0x00, 0x00, 0xFC, 0xF3, 0xA5, 0xC3];
+
+/// `ENTER` with a nesting level, which reads the old frame through EBP.
+///
+/// ```text
+///     enter 8, 2
+///     leave
+///     ret
+/// ```
+pub const ENTER_NESTED: &[u8] = &[0xC8, 0x08, 0x00, 0x02, 0xC9, 0xC3];
+
+/// Loads the IDT register from the six bytes at ESI, then raises #UD.
+///
+/// ```text
+///     lidt [esi]
+///     ud2
+/// ```
+pub const LIDT_UD2: &[u8] = &[0x0F, 0x01, 0x1E, 0x0F, 0x0B];

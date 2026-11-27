@@ -1,0 +1,38 @@
+[package]
+name = "xb-cpu-x64"
+description = "Guest CPU backend translating x86-32 guest code to x86-64 host code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Exports `xb_cpu_x64::testing`: the guest-code snippets (bytes, initial
+# context, expected results) the backend tests run, for the cross-backend
+# comparison.
+testing = []
+
+[dependencies]
+xb-cpu = { path = "../xb-cpu" }
+xb-types = { path = "../xb-types" }
+log = "0.4.29"
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+# MIT. x86 decoder and encoder: guest instructions are decoded as 32-bit code
+# and encoded again for 64-bit mode.
+iced-x86 = { version = "1.22.0", default-features = false, features = ["std", "decoder", "encoder", "instr_info", "intel", "code_asm"] }
+
+[target.'cfg(all(target_arch = "x86_64", unix))'.dependencies]
+# MIT OR Apache-2.0. mmap, mprotect, sigaction, arch_prctl.
+libc = "0.2.190"
+
+[dev-dependencies]
+# The backend-neutral conformance cases (no KVM needed to run them here), and
+# the KVM backend itself as the oracle when the host offers it.
+xb-cpu-kvm = { path = "../xb-cpu-kvm", features = ["testing"] }

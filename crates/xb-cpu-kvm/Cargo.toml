@@ -1,0 +1,28 @@
+[package]
+name = "xb-cpu-kvm"
+description = "Guest CPU backend on Linux KVM hardware virtualization."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Exposes `xb_cpu_kvm::testing`: guest-code cases any `xb_cpu::Cpu` backend can
+# be run against, so the backends can be checked against each other.
+testing = []
+
+[dependencies]
+xb-cpu = { path = "../xb-cpu" }
+xb-types = { path = "../xb-types" }
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+kvm-bindings = "0.14.2"
+kvm-ioctls = "0.25.1"
+libc = "0.2.190"
+log = "0.4.29"
