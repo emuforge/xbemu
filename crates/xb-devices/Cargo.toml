@@ -1,0 +1,17 @@
+[package]
+name = "xb-devices"
+description = "Register-level devices titles drive directly: USB OHCI, hub, XID gamepad, legacy ports, AC'97."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+log = "0.4.29"
+xb-types = { path = "../xb-types" }
