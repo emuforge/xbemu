@@ -1,6 +1,6 @@
-//! Controllers: gamepads through `gilrs`, assigned to the console's four
-//! ports in the order they are connected, with the keyboard as a second
-//! source for port 1.
+//! Controllers: the host's gamepads, assigned to the console's four ports
+//! in the order they are connected, with the keyboard as a second source
+//! for port 1.
 //!
 //! Port 1 always has a pad plugged in (the keyboard is enough to drive it);
 //! ports 2 to 4 have one while a gamepad is assigned to them. A gamepad that
@@ -10,12 +10,40 @@
 //! A gamepad's Guide button is the app's, not the console's: pressing it on
 //! any connected gamepad (one without a port too) asks for the in-game menu
 //! to be opened or closed.
+//!
+//! The devices are read by one source a host: Apple's GameController
+//! framework on macOS ([`macos`]), whose drivers are the only way some pads
+//! are read there (an Xbox pad on USB shows no buttons to anything else),
+//! and `gilrs` elsewhere ([`portable`]). Both answer in `gilrs`'s names for
+//! buttons and axes, so `input.rs` maps every host's pads the same way.
 
-use gilrs::ff::{BaseEffect, BaseEffectType, Effect, EffectBuilder, Repeat, Replay, Ticks};
-use gilrs::{EventType, GamepadId, Gilrs};
 use xb_core::{PORTS, PadState, Rumble};
 
 use crate::input;
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(not(target_os = "macos"))]
+mod portable;
+
+#[cfg(target_os = "macos")]
+use macos::Source;
+#[cfg(not(target_os = "macos"))]
+use portable::Source;
+
+/// A gamepad as its source names it.
+pub type DeviceId = u64;
+
+/// What a source saw happen since it was last asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeviceEvent {
+    /// A gamepad appeared.
+    Connected(DeviceId),
+    /// A gamepad went away.
+    Disconnected(DeviceId),
+    /// A gamepad's button went down.
+    Pressed(DeviceId, gilrs::Button),
+}
 
 /// Which device sits in which port.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,46 +114,28 @@ fn menu_toggle(pressed: impl IntoIterator<Item = gilrs::Button>) -> bool {
 pub struct PadHub {
     /// `None` if the host's gamepad interface could not be opened; the
     /// keyboard still works.
-    gilrs: Option<Gilrs>,
-    ports: Ports<GamepadId>,
+    source: Option<Source>,
+    ports: Ports<DeviceId>,
     rumble: [Rumble; PORTS],
-    /// The running rumble effect of each port; dropping one stops it.
-    effects: [Option<Effect>; PORTS],
 }
 
 impl PadHub {
     /// Opens the host's gamepad interface and assigns the gamepads already
     /// connected. Must be used on the thread that created it.
     pub fn new() -> Self {
-        let gilrs = match Gilrs::new() {
-            Ok(g) => Some(g),
-            Err(gilrs::Error::NotImplemented(_)) => {
-                log::warn!(target: "app", "gamepads are not supported on this host; keyboard only");
-                None
-            }
-            Err(e) => {
-                log::warn!(target: "app", "cannot open gamepads ({e}); keyboard only");
-                None
-            }
-        };
-        let mut hub = Self {
-            gilrs,
-            ports: Ports::new(),
-            rumble: [Rumble::default(); PORTS],
-            effects: [const { None }; PORTS],
-        };
-        let present: Vec<GamepadId> =
-            hub.gilrs.iter().flat_map(|g| g.gamepads().map(|(id, _)| id)).collect();
+        let source = Source::open();
+        let mut hub = Self { source, ports: Ports::new(), rumble: [Rumble::default(); PORTS] };
+        let present = hub.source.as_ref().map(Source::present).unwrap_or_default();
         for id in present {
             hub.plug(id);
         }
         hub
     }
 
-    fn plug(&mut self, id: GamepadId) -> Option<PortChange> {
-        let name = self.gilrs.as_ref().map(|g| g.gamepad(id).name().to_owned()).unwrap_or_default();
-        // What the pad's mapping has for the Guide button, if anything.
-        match self.gilrs.as_ref().and_then(|g| g.gamepad(id).button_code(gilrs::Button::Mode)) {
+    fn plug(&mut self, id: DeviceId) -> Option<PortChange> {
+        let source = self.source.as_ref()?;
+        let name = source.name(id);
+        match source.guide_button(id) {
             Some(code) => {
                 log::debug!(target: "app", "gamepad '{name}': its Guide button ({code}) toggles the menu");
             }
@@ -147,9 +157,11 @@ impl PadHub {
         }
     }
 
-    fn unplug(&mut self, id: GamepadId) -> Option<PortChange> {
+    fn unplug(&mut self, id: DeviceId) -> Option<PortChange> {
         let port = self.ports.unplug(id)?;
-        self.effects[port] = None;
+        if let Some(source) = self.source.as_mut() {
+            source.set_rumble(id, Rumble::default());
+        }
         self.rumble[port] = Rumble::default();
         log::info!(target: "app", "gamepad disconnected from port {}", port + 1);
         Some(PortChange { port, connected: false })
@@ -170,29 +182,30 @@ impl PadHub {
     /// whose gamepad came or went and whether a Guide button asked for the
     /// menu. Call once before reading [`PadHub::pads`].
     ///
-    /// Every button that goes down is logged at DEBUG with the name `gilrs`
-    /// gives it and the host's code, so `--log debug` shows what a pad's
-    /// centre button is taken for.
+    /// Every button that goes down is logged at DEBUG by its source, so
+    /// `--log debug` shows what a pad's centre button is taken for.
     pub fn poll(&mut self) -> Polled {
+        let mut events = Vec::new();
+        if let Some(source) = self.source.as_mut() {
+            source.events(&mut events);
+        }
         let mut changes = Vec::new();
         let mut pressed = Vec::new();
-        while let Some(event) = self.gilrs.as_mut().and_then(Gilrs::next_event) {
-            let change = match event.event {
-                EventType::Connected => self.plug(event.id),
-                EventType::Disconnected => self.unplug(event.id),
-                EventType::ButtonPressed(button, code) => {
-                    let port = self.ports.port_of(event.id);
-                    log::debug!(
-                        target: "app",
-                        "gamepad {} (port {}): button {button:?} ({code}) pressed{}",
-                        event.id,
-                        port.map_or_else(|| "none".to_owned(), |p| (p + 1).to_string()),
-                        if input::is_menu_button(button) { ": the Guide button, toggles the menu" } else { "" },
-                    );
+        for event in events {
+            let change = match event {
+                DeviceEvent::Connected(id) => self.plug(id),
+                DeviceEvent::Disconnected(id) => self.unplug(id),
+                DeviceEvent::Pressed(id, button) => {
+                    if input::is_menu_button(button) {
+                        log::debug!(
+                            target: "app",
+                            "gamepad {id} (port {}): the Guide button, toggles the menu",
+                            self.ports.port_of(id).map_or_else(|| "none".to_owned(), |p| (p + 1).to_string()),
+                        );
+                    }
                     pressed.push(button);
                     None
                 }
-                _ => None,
             };
             changes.extend(change);
         }
@@ -203,14 +216,11 @@ impl PadHub {
     /// keyboard (`keyboard`) merged with it.
     pub fn pads(&self, keyboard: &PadState) -> [PadState; PORTS] {
         let mut pads = [PadState::default(); PORTS];
-        for (port, pad) in pads.iter_mut().enumerate() {
-            let gamepad = self.gilrs.as_ref().zip(self.ports.device(port));
-            if let Some(g) = gamepad.and_then(|(gilrs, id)| gilrs.connected_gamepad(id)) {
-                *pad = input::gamepad_pad(
-                    |b| g.is_pressed(b),
-                    |b| g.button_data(b).map_or(0.0, gilrs::ev::state::ButtonData::value),
-                    |a| g.value(a),
-                );
+        if let Some(source) = self.source.as_ref() {
+            for (port, pad) in pads.iter_mut().enumerate() {
+                if let Some(state) = self.ports.device(port).and_then(|id| source.pad(id)) {
+                    *pad = state;
+                }
             }
         }
         pads[0] = input::merge(&pads[0], keyboard);
@@ -219,36 +229,14 @@ impl PadHub {
 
     /// Sets the rumble motors of the gamepad in `port`, if it has them. Does
     /// nothing when the speeds are the ones already set. Best effort: a
-    /// device that refuses is logged at DEBUG and left alone.
+    /// device that refuses is logged at DEBUG by its source and left alone.
     pub fn set_rumble(&mut self, port: usize, rumble: Rumble) {
         if port >= PORTS || self.rumble[port] == rumble {
             return;
         }
         self.rumble[port] = rumble;
-        // Dropping the old effect stops it.
-        self.effects[port] = None;
-        let (Some(gilrs), Some(id)) = (self.gilrs.as_mut(), self.ports.device(port)) else {
-            return;
-        };
-        if rumble == Rumble::default() || !gilrs.gamepad(id).is_ff_supported() {
-            return;
-        }
-        let motor = |kind| BaseEffect {
-            kind,
-            scheduling: Replay { play_for: Ticks::from_ms(1000), ..Replay::default() },
-            ..BaseEffect::default()
-        };
-        // The console's left motor is the heavy, low-frequency one.
-        let effect = EffectBuilder::new()
-            .add_effect(motor(BaseEffectType::Strong { magnitude: rumble.left }))
-            .add_effect(motor(BaseEffectType::Weak { magnitude: rumble.right }))
-            .repeat(Repeat::Infinitely)
-            .gamepads(&[id])
-            .finish(gilrs)
-            .and_then(|effect| effect.play().map(|()| effect));
-        match effect {
-            Ok(effect) => self.effects[port] = Some(effect),
-            Err(e) => log::debug!(target: "app", "rumble on port {}: {e}", port + 1),
+        if let (Some(source), Some(id)) = (self.source.as_mut(), self.ports.device(port)) {
+            source.set_rumble(id, rumble);
         }
     }
 }

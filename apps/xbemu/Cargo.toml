@@ -29,8 +29,15 @@ raw-window-metal = "0.4.0"
 # one (picker.rs); version 0.3 of the bindings winit uses, whose panel calls
 # are safe.
 objc2 = "0.6.5"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSString", "NSURL"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSEnumerator", "NSError", "NSString", "NSURL"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSWindow", "NSResponder", "NSApplication", "NSRunningApplication"] }
+# Zlib OR Apache-2.0 OR MIT. The gamepads on macOS (pads/macos.rs): Apple's
+# drivers feed this framework, and some pads (an Xbox pad on USB) can be
+# read through nothing else.
+objc2-game-controller = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-haptics", "GCController", "GCDevice", "GCDeviceHaptics", "GCExtendedGamepad", "GCPhysicalInputProfile", "GCControllerElement", "GCControllerButtonInput", "GCControllerDirectionPad", "GCControllerAxisInput"] }
+# Zlib OR Apache-2.0 OR MIT. Rumble on macOS (pads/macos/haptics.rs): the
+# GameController framework drives a pad's motors through Core Haptics.
+objc2-core-haptics = { version = "0.3.2", default-features = false, features = ["std", "CHHapticEngine", "CHHapticEvent", "CHHapticParameter", "CHHapticPattern", "CHHapticPatternPlayer"] }
 
 # PipeWire and PulseAudio desktops are reached through cpal's PulseAudio host
 # (a Rust implementation of the protocol; no system library). Their ALSA

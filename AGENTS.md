@@ -83,8 +83,9 @@ implements the trait.
 
 - **`unsafe`** is allowed only in `xb-mem`, `xb-cpu-kvm`, `xb-cpu-x64`,
   `xb-cpu-interp` (its code generator, `src/jit`, alone), `xb-gpu`,
-  `xb-apu`, `xb-core` and the app's `surface.rs` (creating the Vulkan
-  surface). Every other crate has `#![forbid(unsafe_code)]`. Every `unsafe` block MUST have a `// SAFETY:`
+  `xb-apu`, `xb-core`, the app's `surface.rs` (creating the Vulkan
+  surface) and its `pads/macos` module (the GameController and Core Haptics
+  frameworks). Every other crate has `#![forbid(unsafe_code)]`. Every `unsafe` block MUST have a `// SAFETY:`
   comment and every `unsafe fn` a `# Safety` section.
 - **C code** exists only as vendored libraries under `vendor/` (the GPU
   renderer and the APU), each behind one crate. New C glue MUST NOT be added

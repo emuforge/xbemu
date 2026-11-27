@@ -46,18 +46,34 @@ The app's own keys:
 | F12 | Save a screenshot (JPEG, the picture with the overlay) |
 
 On a gamepad the Guide button (the Xbox button in the centre of an Xbox
-pad, PS or Home on others; `Button::Mode` in `gilrs`) opens and closes the
-menu, on any connected pad. The original controller has no such button, so
+pad, PS or Home on others; `Button::Mode` in `gilrs`, `buttonHome` in
+GameController) opens and closes the menu, on any connected pad; on macOS the
+app asks the system to leave the button to it. The original controller has no such button, so
 the title never sees it. `--log debug` logs each gamepad button as it goes
-down with the name it is taken for, and at connection which code a pad's
+down with the name it is taken for (on macOS the Guide button alone), and at connection which code a pad's
 Guide button has; a pad without one is reported at INFO.
 
 There is no button combo by default. `menu_combo` in `settings.txt` can name
 one (a mask of the console's buttons, `0x00c0` for both stick clicks, held
 for half a second); `0x0000` is none.
 
-Gamepads (any pad `gilrs` knows; up to four, assigned to ports 1 to 4 in the
-order they are connected, hot-pluggable, with rumble where the pad has it):
+Gamepads (up to four, assigned to ports 1 to 4 in the order they are
+connected, hot-pluggable, with rumble where the pad and the host allow it)
+are read by one source a host (`pads/`):
+
+- **macOS:** Apple's GameController framework (`pads/macos.rs`), which reads
+  every pad macOS's own drivers support (Xbox, DualSense, DualShock 4,
+  Switch Pro, MFi) in one layout. An Xbox pad on USB can be read through
+  nothing else: its driver shows other interfaces only the raw protocol, no
+  buttons. A pad the framework does not support is not read. Rumble goes
+  through Core Haptics (`pads/macos/haptics.rs`), one engine for each handle
+  where the pad has two; an Xbox pad rumbles over Bluetooth, but macOS does
+  not pass rumble to one on USB.
+- **Elsewhere:** `gilrs` (`pads/portable.rs`), naming each pad's controls
+  from the SDL controller database.
+
+Both answer in `gilrs`'s names, so one mapping (`input.rs`) serves every
+host:
 
 | Modern pad | Xbox |
 |---|---|
@@ -137,10 +153,11 @@ ran short and the delay the device reported.
 - No core call outside the emulation thread.
 - `Core::shutdown` returns before the window or the audio stream is dropped.
 - The audio callback takes no lock and does not allocate.
-- `unsafe` is denied crate-wide and allowed in exactly one module,
-  `surface.rs`, which creates the Vulkan surface on the core's instance
+- `unsafe` is denied crate-wide and allowed in two modules: `surface.rs`,
+  which creates the Vulkan surface on the core's instance
   (`SurfaceProvider::create_surface` is an `unsafe fn` and `ash` calls are
-  unsafe). Nothing else may use it.
+  unsafe), and `pads/macos` (with its `haptics` child), whose GameController
+  and Core Haptics bindings are all `unsafe` calls. Nothing else may use it.
 
 ## Build needs
 

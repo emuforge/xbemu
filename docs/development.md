@@ -35,7 +35,8 @@ xbemu <disc image> [--data-dir DIR] [--fullscreen] [--log LEVEL]
 
 - F1, Escape or a gamepad's Guide button (the Xbox button in its centre)
   opens and closes the in-game menu. `--log debug` logs every gamepad button
-  as it goes down, with the name it is taken for. Fullscreen is a setting (`fullscreen` in `settings.txt`, the menu's row); F11, Alt+Enter and a double click on the picture switch it, and `--fullscreen` turns it on. F12 saves a screenshot (JPEG)
+  as it goes down, with the name it is taken for (on macOS the Guide button
+  alone). Fullscreen is a setting (`fullscreen` in `settings.txt`, the menu's row); F11, Alt+Enter and a double click on the picture switch it, and `--fullscreen` turns it on. F12 saves a screenshot (JPEG)
   into `--screenshot-dir`, by default `screenshots/` in the data directory.
 - In the menu the keyboard's Enter chooses the highlighted row and
   Backspace goes back (they are Start and Back in a title, and Start closes
